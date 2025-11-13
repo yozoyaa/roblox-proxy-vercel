@@ -1,3 +1,4 @@
+// api/proxy.js
 // Vercel serverless function acting as a safe GET proxy for Roblox APIs
 
 const ALLOWED_HOSTS = [
@@ -49,17 +50,22 @@ export default async function handler(req, res) {
     }
 
     // ---------- Build headers ----------
-    const headers = {};
+    const headers = {
+      // act like a normal browser hitting Roblox
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "application/json, text/plain, */*",
+      Referer: "https://www.roblox.com/",
+    };
 
-    // 1) Roblox web APIs that need auth cookies (dummy account)
-    // COOKIES should be a full cookie string, e.g.:
-    // ".ROBLOSECURITY=xxx; otherCookie=yyy"
+    // 1) Roblox web API auth via cookie (dummy account)
     if (process.env.COOKIES) {
-      headers["cookie"] = process.env.COOKIES;
+      // COOKIES should be like: ".ROBLOSECURITY=xxx; otherCookie=yyy"
+      headers["Cookie"] = process.env.COOKIES;
     }
 
-    // 2) Roblox Open Cloud APIs that need x-api-key (for automation)
-    // OPEN_CLOUD_KEY should be set in Vercel env
+    // 2) Roblox Open Cloud auth (x-api-key)
     if (urlObj.host === "apis.roblox.com" && process.env.OPEN_CLOUD_KEY) {
       headers["x-api-key"] = process.env.OPEN_CLOUD_KEY;
     }
@@ -76,7 +82,19 @@ export default async function handler(req, res) {
     try {
       parsedBody = JSON.parse(textBody);
     } catch {
-      parsedBody = textBody;
+      parsedBody = textBody; // not JSON, return as string
+    }
+
+    // Helpful logging (server-side only)
+    if (status !== 200) {
+      console.error("Upstream Roblox error:", {
+        url: targetUrl,
+        status,
+        bodyPreview:
+          typeof parsedBody === "string"
+            ? parsedBody.slice(0, 300)
+            : JSON.stringify(parsedBody).slice(0, 300),
+      });
     }
 
     return res.status(200).json({
@@ -89,7 +107,7 @@ export default async function handler(req, res) {
     return res.status(500).json({
       ok: false,
       error: "Internal proxy error",
-      // never include env values in responses
+      // never include cookies or env values here
       detail: String(err),
     });
   }
