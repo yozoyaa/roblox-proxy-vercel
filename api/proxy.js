@@ -142,12 +142,11 @@ export default async function handler(req, res) {
 						tried.push("cookie");
 						usedMethod = "cookie";
 
-						const cookieVal = rbxCookie.trim();
 						sentCookieLen = cookieVal.length;
 
 						const headers2 = {
 							...baseHeaders,
-							Cookie: `.ROBLOSECURITY=${cookieVal}`,
+							Cookie: `.ROBLOSECURITY=${rbxCookie}`,
 						};
 
 						console.log(
@@ -167,12 +166,11 @@ export default async function handler(req, res) {
 					tried.push("cookie");
 					usedMethod = "cookie";
 
-					const cookieVal = rbxCookie.trim();
 					sentCookieLen = cookieVal.length;
 
 					const headers = {
 						...baseHeaders,
-						Cookie: `.ROBLOSECURITY=${cookieVal}`,
+						Cookie: `.ROBLOSECURITY=${rbxCookie}`,
 					};
 
 					console.log(
@@ -216,12 +214,11 @@ export default async function handler(req, res) {
 				tried.push("cookie");
 				usedMethod = "cookie";
 
-				const cookieVal = rbxCookie.trim();
 				sentCookieLen = cookieVal.length;
 
 				const headers = {
 					...baseHeaders,
-					Cookie: `.ROBLOSECURITY=${cookieVal}`,
+					Cookie: `.ROBLOSECURITY=${rbxCookie}`,
 				};
 
 				console.log(
