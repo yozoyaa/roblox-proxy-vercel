@@ -1,13 +1,13 @@
 // api/proxy.js
 // Vercel serverless GET proxy for Roblox APIs (safe host allowlist)
 //
-// Auth rules (your requested behavior):
-// - apis.roblox.com  -> use ONLY Open Cloud API key (no cookie)
-// - other allowed domains -> use cookie (like original approach)
+// TODO implemented:
+// 1) If apis.roblox.com returns 403 using apiKey, retry using cookie.
+// 2) Add logs (console.log) so Vercel shows request logs.
 //
 // Env vars (Vercel):
-// - ROBLOX_OPEN_CLOUD_KEY     (required for apis.roblox.com calls)
-// - ROBLOX_SECURITY_COOKIE    (required for non-apis.roblox.com calls; value only, no ".ROBLOSECURITY=" prefix)
+// - ROBLOX_OPEN_CLOUD_KEY      (API key value)
+// - ROBLOX_SECURITY_COOKIE     (cookie value only, WITHOUT ".ROBLOSECURITY=" prefix)
 //
 // Response is ALWAYS JSON:
 // {
@@ -17,7 +17,7 @@
 //   json: object|null,
 //   text: string,
 //   error?: string,
-//   authSent: { apiKey: boolean, cookie: boolean, cookieLen: number }
+//   authSent: { method: "apiKey"|"cookie"|"none", tried: string[], cookieLen: number }
 // }
 
 const ALLOWED_HOSTS = [
@@ -32,16 +32,30 @@ function truthy(s) {
 	return typeof s === "string" && s.trim() !== "";
 }
 
+function safeUpstreamLabel(urlObj) {
+	// Don’t print full query; keep logs readable
+	return `${urlObj.host}${urlObj.pathname}`;
+}
+
 export default async function handler(req, res) {
+	// Prevent caching (helps ensure logs always show per request)
+	res.setHeader("Cache-Control", "no-store");
+
+	const requestId =
+		typeof crypto !== "undefined" && crypto.randomUUID
+			? crypto.randomUUID()
+			: `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
 	try {
-		// Only allow GET
 		if (req.method !== "GET") {
 			res.setHeader("Allow", "GET");
+			console.log(`[Proxy:${requestId}] 405 Method Not Allowed`);
 			return res.status(405).json({ ok: false, error: "Method Not Allowed" });
 		}
 
 		const target = req.query.url;
 		if (!target) {
+			console.log(`[Proxy:${requestId}] 400 Missing url param`);
 			return res.status(400).json({ ok: false, error: "Missing 'url' query parameter" });
 		}
 
@@ -49,6 +63,7 @@ export default async function handler(req, res) {
 		try {
 			targetUrl = decodeURIComponent(target);
 		} catch {
+			console.log(`[Proxy:${requestId}] 400 Invalid URL encoding`);
 			return res.status(400).json({ ok: false, error: "Invalid URL encoding" });
 		}
 
@@ -56,100 +71,210 @@ export default async function handler(req, res) {
 		try {
 			urlObj = new URL(targetUrl);
 		} catch {
+			console.log(`[Proxy:${requestId}] 400 Invalid URL format`);
 			return res.status(400).json({ ok: false, error: "Invalid URL format" });
 		}
 
-		// Safety: don't make this an open proxy
 		if (!ALLOWED_HOSTS.includes(urlObj.host)) {
+			console.log(`[Proxy:${requestId}] 403 Host not allowed: ${urlObj.host}`);
 			return res.status(403).json({ ok: false, error: "Host not allowed" });
 		}
 
 		const openCloudKey = process.env.ROBLOX_OPEN_CLOUD_KEY;
 		const rbxCookie = process.env.ROBLOX_SECURITY_COOKIE;
 
-		const headers = {
+		const baseHeaders = {
 			Accept: "application/json",
 			"User-Agent": "vercel-proxy/1.0",
 		};
 
-		let sentApiKey = false;
-		let sentCookie = false;
-		let cookieLen = 0;
+		const tried = [];
+		let usedMethod = "none";
+		let sentCookieLen = 0;
 
-		if (urlObj.host === "apis.roblox.com") {
-			// apis.roblox.com -> Open Cloud API key ONLY
-			if (!truthy(openCloudKey)) {
-				return res.status(200).json({
-					ok: false,
-					upstreamStatus: 0,
-					upstreamContentType: "",
-					json: null,
-					text: "",
-					error: "Missing ROBLOX_OPEN_CLOUD_KEY env var for apis.roblox.com",
-					authSent: { apiKey: false, cookie: false, cookieLen: 0 },
-				});
-			}
-
-			headers["x-api-key"] = openCloudKey.trim();
-			sentApiKey = true;
-		} else {
-			// Other allowed Roblox domains -> cookie auth (like original)
-			if (!truthy(rbxCookie)) {
-				return res.status(200).json({
-					ok: false,
-					upstreamStatus: 0,
-					upstreamContentType: "",
-					json: null,
-					text: "",
-					error: `Missing ROBLOX_SECURITY_COOKIE env var for ${urlObj.host}`,
-					authSent: { apiKey: false, cookie: false, cookieLen: 0 },
-				});
-			}
-
-			const cookieVal = rbxCookie.trim();
-			cookieLen = cookieVal.length;
-			headers["Cookie"] = `.ROBLOSECURITY=${cookieVal}`;
-			sentCookie = true;
-		}
-
-		let upstreamStatus = 0;
-		let upstreamContentType = "";
-		let bodyText = "";
-		let fetchError = null;
-
-		try {
+		async function doFetch(withHeaders) {
 			const upstream = await fetch(targetUrl, {
 				method: "GET",
-				headers,
+				headers: withHeaders,
 				redirect: "follow",
 			});
 
-			upstreamStatus = upstream.status;
-			upstreamContentType = upstream.headers.get("content-type") || "";
-			bodyText = await upstream.text();
+			const upstreamStatus = upstream.status;
+			const upstreamContentType = upstream.headers.get("content-type") || "";
+			const text = await upstream.text();
+
+			let json = null;
+			if (upstreamContentType.includes("application/json") && text) {
+				try {
+					json = JSON.parse(text);
+				} catch {
+					json = null;
+				}
+			}
+
+			return { upstreamStatus, upstreamContentType, text: text || "", json };
+		}
+
+		console.log(
+			`[Proxy:${requestId}] START host=${urlObj.host} path=${safeUpstreamLabel(urlObj)}`
+		);
+
+		let result = null;
+		let fetchError = null;
+
+		try {
+			if (urlObj.host === "apis.roblox.com") {
+				// 1) Try API key first
+				if (truthy(openCloudKey)) {
+					tried.push("apiKey");
+					usedMethod = "apiKey";
+
+					const headers = { ...baseHeaders, "x-api-key": openCloudKey.trim() };
+					console.log(`[Proxy:${requestId}] TRY apiKey -> ${safeUpstreamLabel(urlObj)}`);
+
+					result = await doFetch(headers);
+
+					console.log(
+						`[Proxy:${requestId}] apiKey status=${result.upstreamStatus} ct=${result.upstreamContentType}`
+					);
+
+					// 2) If 403, fallback to cookie (if present)
+					if (result.upstreamStatus === 403 && truthy(rbxCookie)) {
+						tried.push("cookie");
+						usedMethod = "cookie";
+
+						const cookieVal = rbxCookie.trim();
+						sentCookieLen = cookieVal.length;
+
+						const headers2 = {
+							...baseHeaders,
+							Cookie: `.ROBLOSECURITY=${cookieVal}`,
+						};
+
+						console.log(
+							`[Proxy:${requestId}] FALLBACK cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(
+								urlObj
+							)}`
+						);
+
+						result = await doFetch(headers2);
+
+						console.log(
+							`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
+						);
+					}
+				} else if (truthy(rbxCookie)) {
+					// No API key available, go cookie directly
+					tried.push("cookie");
+					usedMethod = "cookie";
+
+					const cookieVal = rbxCookie.trim();
+					sentCookieLen = cookieVal.length;
+
+					const headers = {
+						...baseHeaders,
+						Cookie: `.ROBLOSECURITY=${cookieVal}`,
+					};
+
+					console.log(
+						`[Proxy:${requestId}] TRY cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(
+							urlObj
+						)}`
+					);
+
+					result = await doFetch(headers);
+
+					console.log(
+						`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
+					);
+				} else {
+					console.log(`[Proxy:${requestId}] No auth available for apis.roblox.com`);
+					return res.status(200).json({
+						ok: false,
+						upstreamStatus: 0,
+						upstreamContentType: "",
+						json: null,
+						text: "",
+						error: "Missing ROBLOX_OPEN_CLOUD_KEY and ROBLOX_SECURITY_COOKIE env vars",
+						authSent: { method: "none", tried, cookieLen: 0 },
+					});
+				}
+			} else {
+				// Non-apis.roblox.com -> cookie only (original behavior)
+				if (!truthy(rbxCookie)) {
+					console.log(`[Proxy:${requestId}] Missing cookie for ${urlObj.host}`);
+					return res.status(200).json({
+						ok: false,
+						upstreamStatus: 0,
+						upstreamContentType: "",
+						json: null,
+						text: "",
+						error: `Missing ROBLOX_SECURITY_COOKIE env var for ${urlObj.host}`,
+						authSent: { method: "none", tried, cookieLen: 0 },
+					});
+				}
+
+				tried.push("cookie");
+				usedMethod = "cookie";
+
+				const cookieVal = rbxCookie.trim();
+				sentCookieLen = cookieVal.length;
+
+				const headers = {
+					...baseHeaders,
+					Cookie: `.ROBLOSECURITY=${cookieVal}`,
+				};
+
+				console.log(
+					`[Proxy:${requestId}] TRY cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(urlObj)}`
+				);
+
+				result = await doFetch(headers);
+
+				console.log(
+					`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
+				);
+			}
 		} catch (e) {
 			fetchError = String(e);
+			console.error(`[Proxy:${requestId}] FETCH ERROR: ${fetchError}`);
 		}
 
-		let parsedJson = null;
-		if (upstreamContentType.includes("application/json") && bodyText) {
-			try {
-				parsedJson = JSON.parse(bodyText);
-			} catch {
-				parsedJson = null;
-			}
+		if (!result) {
+			return res.status(200).json({
+				ok: false,
+				upstreamStatus: 0,
+				upstreamContentType: "",
+				json: null,
+				text: "",
+				error: fetchError || "Unknown fetch error",
+				authSent: { method: usedMethod, tried, cookieLen: sentCookieLen },
+			});
 		}
+
+		const ok = fetchError == null && result.upstreamStatus >= 200 && result.upstreamStatus < 300;
+
+		console.log(
+			`[Proxy:${requestId}] END ok=${ok} status=${result.upstreamStatus} method=${usedMethod} tried=${tried.join(
+				","
+			)}`
+		);
 
 		return res.status(200).json({
-			ok: fetchError == null && upstreamStatus >= 200 && upstreamStatus < 300,
-			upstreamStatus,
-			upstreamContentType,
-			json: parsedJson,
-			text: bodyText || "",
+			ok,
+			upstreamStatus: result.upstreamStatus,
+			upstreamContentType: result.upstreamContentType,
+			json: result.json,
+			text: result.text,
 			error: fetchError || undefined,
-			authSent: { apiKey: sentApiKey, cookie: sentCookie, cookieLen },
+			authSent: {
+				method: usedMethod,
+				tried,
+				cookieLen: sentCookieLen,
+			},
 		});
 	} catch (err) {
+		console.error(`[Proxy:${requestId}] HANDLER ERROR:`, err);
 		return res.status(200).json({
 			ok: false,
 			upstreamStatus: 0,
@@ -157,7 +282,7 @@ export default async function handler(req, res) {
 			json: null,
 			text: "",
 			error: String(err),
-			authSent: { apiKey: false, cookie: false, cookieLen: 0 },
+			authSent: { method: "none", tried: [], cookieLen: 0 },
 		});
 	}
 }
