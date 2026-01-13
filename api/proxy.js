@@ -142,7 +142,7 @@ export default async function handler(req, res) {
 						tried.push("cookie");
 						usedMethod = "cookie";
 
-						sentCookieLen = cookieVal.length;
+						sentCookieLen = rbxCookie.length;
 
 						const headers2 = {
 							...baseHeaders,
@@ -166,7 +166,7 @@ export default async function handler(req, res) {
 					tried.push("cookie");
 					usedMethod = "cookie";
 
-					sentCookieLen = cookieVal.length;
+					sentCookieLen = rbxCookie.length;
 
 					const headers = {
 						...baseHeaders,
@@ -214,7 +214,7 @@ export default async function handler(req, res) {
 				tried.push("cookie");
 				usedMethod = "cookie";
 
-				sentCookieLen = cookieVal.length;
+				sentCookieLen = rbxCookie.length;
 
 				const headers = {
 					...baseHeaders,
