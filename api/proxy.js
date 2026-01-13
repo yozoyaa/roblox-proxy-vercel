@@ -7,7 +7,7 @@
 //
 // Env vars (Vercel):
 // - ROBLOX_OPEN_CLOUD_KEY      (API key value)
-// - ROBLOX_SECURITY_COOKIE     (cookie value only, WITHOUT ".ROBLOSECURITY=" prefix)
+// - ROBLOX_SECURITY_COOKIE     (cookie value only)
 //
 // Response is ALWAYS JSON.
 
@@ -146,7 +146,7 @@ export default async function handler(req, res) {
 
 						const headers2 = {
 							...baseHeaders,
-							Cookie: `.ROBLOSECURITY=${rbxCookie}`,
+							Cookie: rbxCookie,
 						};
 
 						console.log(
@@ -170,7 +170,7 @@ export default async function handler(req, res) {
 
 					const headers = {
 						...baseHeaders,
-						Cookie: `.ROBLOSECURITY=${rbxCookie}`,
+						Cookie: rbxCookie,
 					};
 
 					console.log(
@@ -218,7 +218,7 @@ export default async function handler(req, res) {
 
 				const headers = {
 					...baseHeaders,
-					Cookie: `.ROBLOSECURITY=${rbxCookie}`,
+					Cookie: rbxCookie,
 				};
 
 				console.log(
