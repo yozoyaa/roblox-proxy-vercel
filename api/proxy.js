@@ -1,6 +1,4 @@
 // api/proxy.js
-// Vercel serverless function acting as a safe GET proxy for Roblox APIs
-
 const ALLOWED_HOSTS = [
   "games.roblox.com",
   "apis.roblox.com",
@@ -11,7 +9,6 @@ const ALLOWED_HOSTS = [
 
 export default async function handler(req, res) {
   try {
-    // Only allow GET
     if (req.method !== "GET") {
       res.setHeader("Allow", "GET");
       return res.status(405).json({ ok: false, error: "Method Not Allowed" });
@@ -19,96 +16,64 @@ export default async function handler(req, res) {
 
     const target = req.query.url;
     if (!target) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing 'url' query parameter" });
+      return res.status(400).json({ ok: false, error: "Missing 'url' query parameter" });
     }
 
     let targetUrl;
     try {
       targetUrl = decodeURIComponent(target);
-    } catch (e) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Invalid URL encoding" });
+    } catch {
+      return res.status(400).json({ ok: false, error: "Invalid URL encoding" });
     }
 
     let urlObj;
     try {
       urlObj = new URL(targetUrl);
-    } catch (e) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Invalid URL format" });
+    } catch {
+      return res.status(400).json({ ok: false, error: "Invalid URL format" });
     }
 
-    // Safety: don't make this an open proxy
     if (!ALLOWED_HOSTS.includes(urlObj.host)) {
-      return res
-        .status(403)
-        .json({ ok: false, error: `Host not allowed: ${urlObj.host}` });
+      return res.status(403).json({ ok: false, error: "Host not allowed" });
     }
 
-    // ---------- Build headers ----------
+    // Add Open Cloud API key ONLY on the server
+    const openCloudKey = process.env.ROBLOX_OPEN_CLOUD_KEY;
+
     const headers = {
-      // act like a normal browser hitting Roblox
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "application/json, text/plain, */*",
-      Referer: "https://www.roblox.com/",
+      "Accept": "application/json",
     };
 
-    // 1) Roblox web API auth via cookie (dummy account)
-    if (process.env.COOKIES) {
-      // COOKIES should be like: ".ROBLOSECURITY=xxx; otherCookie=yyy"
-      headers["Cookie"] = process.env.COOKIES;
+    // Only attach x-api-key for apis.roblox.com Open Cloud endpoints
+    if (urlObj.host === "apis.roblox.com") {
+      if (!openCloudKey) {
+        return res.status(500).json({ ok: false, error: "Missing ROBLOX_OPEN_CLOUD_KEY env var" });
+      }
+      headers["x-api-key"] = openCloudKey;
     }
 
-    // 2) Roblox Open Cloud auth (x-api-key)
-    if (urlObj.host === "apis.roblox.com" && process.env.OPEN_CLOUD_KEY) {
-      headers["x-api-key"] = process.env.OPEN_CLOUD_KEY;
-    }
-
-    const upstreamResponse = await fetch(targetUrl, {
+    const upstream = await fetch(targetUrl, {
       method: "GET",
       headers,
     });
 
-    const status = upstreamResponse.status;
-    const textBody = await upstreamResponse.text();
+    const body = await upstream.text();
 
-    let parsedBody;
-    try {
-      parsedBody = JSON.parse(textBody);
-    } catch {
-      parsedBody = textBody; // not JSON, return as string
+    // Pass through status + body
+    res.status(upstream.status);
+
+    // Try to return JSON if possible
+    const contentType = upstream.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      try {
+        return res.json(JSON.parse(body));
+      } catch {
+        // fall through
+      }
     }
 
-    // Helpful logging (server-side only)
-    if (status !== 200) {
-      console.error("Upstream Roblox error:", {
-        url: targetUrl,
-        status,
-        bodyPreview:
-          typeof parsedBody === "string"
-            ? parsedBody.slice(0, 300)
-            : JSON.stringify(parsedBody).slice(0, 300),
-      });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      upstreamStatus: status,
-      body: parsedBody,
-    });
+    return res.send(body);
   } catch (err) {
-    console.error("Proxy error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Internal proxy error",
-      // never include cookies or env values here
-      detail: String(err),
-    });
+    return res.status(500).json({ ok: false, error: String(err) });
   }
 }
