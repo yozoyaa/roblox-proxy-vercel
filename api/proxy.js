@@ -1,18 +1,23 @@
 // api/proxy.js
-// Vercel serverless GET proxy for Roblox APIs
+// Vercel serverless GET proxy for Roblox APIs (safe host allowlist)
+//
+// Auth rules (your requested behavior):
+// - apis.roblox.com  -> use ONLY Open Cloud API key (no cookie)
+// - other allowed domains -> use cookie (like original approach)
 //
 // Env vars (Vercel):
-// - ROBLOX_OPEN_CLOUD_KEY       (optional)
-// - ROBLOX_SECURITY_COOKIE      (optional; value only, WITHOUT ".ROBLOSECURITY=" prefix)
+// - ROBLOX_OPEN_CLOUD_KEY     (required for apis.roblox.com calls)
+// - ROBLOX_SECURITY_COOKIE    (required for non-apis.roblox.com calls; value only, no ".ROBLOSECURITY=" prefix)
 //
-// Response is ALWAYS JSON so Roblox can always JSONDecode it:
+// Response is ALWAYS JSON:
 // {
 //   ok: boolean,
-//   upstreamStatus: number,            // 0 if network error before response
+//   upstreamStatus: number,
 //   upstreamContentType: string,
-//   json: object|null,                 // parsed JSON when possible
-//   text: string,                      // raw upstream body text
-//   error?: string                     // present when fetch threw
+//   json: object|null,
+//   text: string,
+//   error?: string,
+//   authSent: { apiKey: boolean, cookie: boolean, cookieLen: number }
 // }
 
 const ALLOWED_HOSTS = [
@@ -23,7 +28,11 @@ const ALLOWED_HOSTS = [
 	"catalog.roblox.com",
 ];
 
-module.exports = async function handler(req, res) {
+function truthy(s) {
+	return typeof s === "string" && s.trim() !== "";
+}
+
+export default async function handler(req, res) {
 	try {
 		// Only allow GET
 		if (req.method !== "GET") {
@@ -63,26 +72,53 @@ module.exports = async function handler(req, res) {
 			"User-Agent": "vercel-proxy/1.0",
 		};
 
-		// Attach auth ONLY for apis.roblox.com
+		let sentApiKey = false;
+		let sentCookie = false;
+		let cookieLen = 0;
+
 		if (urlObj.host === "apis.roblox.com") {
-			if (openCloudKey && openCloudKey.trim() !== "") {
-				headers["x-api-key"] = openCloudKey.trim();
+			// apis.roblox.com -> Open Cloud API key ONLY
+			if (!truthy(openCloudKey)) {
+				return res.status(200).json({
+					ok: false,
+					upstreamStatus: 0,
+					upstreamContentType: "",
+					json: null,
+					text: "",
+					error: "Missing ROBLOX_OPEN_CLOUD_KEY env var for apis.roblox.com",
+					authSent: { apiKey: false, cookie: false, cookieLen: 0 },
+				});
 			}
 
-			if (rbxCookie && rbxCookie.trim() !== "") {
-				// IMPORTANT: cookie header must be exactly formatted like this:
-				headers["Cookie"] = `.ROBLOSECURITY=${rbxCookie.trim()}`;
+			headers["x-api-key"] = openCloudKey.trim();
+			sentApiKey = true;
+		} else {
+			// Other allowed Roblox domains -> cookie auth (like original)
+			if (!truthy(rbxCookie)) {
+				return res.status(200).json({
+					ok: false,
+					upstreamStatus: 0,
+					upstreamContentType: "",
+					json: null,
+					text: "",
+					error: `Missing ROBLOX_SECURITY_COOKIE env var for ${urlObj.host}`,
+					authSent: { apiKey: false, cookie: false, cookieLen: 0 },
+				});
 			}
+
+			const cookieVal = rbxCookie.trim();
+			cookieLen = cookieVal.length;
+			headers["Cookie"] = `.ROBLOSECURITY=${cookieVal}`;
+			sentCookie = true;
 		}
 
-		let upstream;
-		let bodyText = "";
 		let upstreamStatus = 0;
 		let upstreamContentType = "";
+		let bodyText = "";
 		let fetchError = null;
 
 		try {
-			upstream = await fetch(targetUrl, {
+			const upstream = await fetch(targetUrl, {
 				method: "GET",
 				headers,
 				redirect: "follow",
@@ -95,7 +131,6 @@ module.exports = async function handler(req, res) {
 			fetchError = String(e);
 		}
 
-		// Attempt to parse JSON when upstream claims JSON
 		let parsedJson = null;
 		if (upstreamContentType.includes("application/json") && bodyText) {
 			try {
@@ -105,7 +140,6 @@ module.exports = async function handler(req, res) {
 			}
 		}
 
-		// Always respond JSON (so Roblox never gets body=nil)
 		return res.status(200).json({
 			ok: fetchError == null && upstreamStatus >= 200 && upstreamStatus < 300,
 			upstreamStatus,
@@ -113,6 +147,7 @@ module.exports = async function handler(req, res) {
 			json: parsedJson,
 			text: bodyText || "",
 			error: fetchError || undefined,
+			authSent: { apiKey: sentApiKey, cookie: sentCookie, cookieLen },
 		});
 	} catch (err) {
 		return res.status(200).json({
@@ -122,6 +157,7 @@ module.exports = async function handler(req, res) {
 			json: null,
 			text: "",
 			error: String(err),
+			authSent: { apiKey: false, cookie: false, cookieLen: 0 },
 		});
 	}
 }
