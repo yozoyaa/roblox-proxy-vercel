@@ -11,16 +11,17 @@
 //
 // Response is ALWAYS JSON.
 
-const HYBRID_HOSTS = [
-	"apis.roblox.com",
-];
+// Force Node runtime (prevents Edge runtimes stripping Cookie header in fetch)
+export const config = { runtime: "nodejs" };
+
+const HYBRID_HOSTS = ["apis.roblox.com"];
 
 const COOKIE_ONLY_HOSTS = [
 	"games.roblox.com",
 	"users.roblox.com",
 	"thumbnails.roblox.com",
 	"catalog.roblox.com",
-  "inventory.roblox.com",
+	"inventory.roblox.com",
 ];
 
 // Allowlist = union of both
@@ -32,6 +33,32 @@ function truthy(s) {
 
 function safeUpstreamLabel(urlObj) {
 	return `${urlObj.host}${urlObj.pathname}`;
+}
+
+// Important: Vercel env pastes often include quotes/newlines.
+// Roblox requires a valid cookie pair in the Cookie header.
+function normalizeRobloxCookie(raw) {
+	if (typeof raw !== "string") return "";
+
+	let s = raw.trim();
+
+	// strip wrapping quotes (common when pasting into env UI)
+	if (
+		(s.startsWith('"') && s.endsWith('"')) ||
+		(s.startsWith("'") && s.endsWith("'"))
+	) {
+		s = s.slice(1, -1).trim();
+	}
+
+	// remove ALL whitespace (spaces/newlines/tabs) which can break cookie parsing
+	s = s.replace(/\s+/g, "").trim();
+
+	// allow storing token-only; we’ll prefix it
+	if (!s.includes("ROBLOSECURITY=")) {
+		s = `.ROBLOSECURITY=${s}`;
+	}
+
+	return s;
 }
 
 export default async function handler(req, res) {
@@ -76,13 +103,14 @@ export default async function handler(req, res) {
 			return res.status(403).json({ ok: false, error: "Host not allowed" });
 		}
 
-		const openCloudKey = process.env.ROBLOX_OPEN_CLOUD_KEY;
-		const rbxCookie = process.env.ROBLOX_SECURITY_COOKIE;
+		const openCloudKey = process.env.ROBLOX_OPEN_CLOUD_KEY || "";
+		const rbxCookie = normalizeRobloxCookie(process.env.ROBLOX_SECURITY_COOKIE);
 
 		const baseHeaders = {
 			Accept: "application/json",
-			"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			"User-Agent":
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+				"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 			Referer: "https://www.roblox.com/",
 		};
 
@@ -90,13 +118,49 @@ export default async function handler(req, res) {
 		let usedMethod = "none";
 		let sentCookieLen = 0;
 
-		async function doFetch(withHeaders) {
-			const upstream = await fetch(targetUrl, {
+		async function doFetch(url, withHeaders) {
+			const h = new Headers(withHeaders);
+
+			// Debug without leaking cookie:
+			const cookieHeader = h.get("cookie") || "";
+			console.log(
+				`[Proxy:${requestId}] outgoing cookieHeaderLen=${cookieHeader.length} hasPair=${cookieHeader.includes(
+					"ROBLOSECURITY="
+				)} url=${new URL(url).host}${new URL(url).pathname}`
+			);
+
+			// Use manual redirect so headers (esp Cookie) never get silently lost.
+			const upstream = await fetch(url, {
 				method: "GET",
-				headers: withHeaders,
-				redirect: "follow",
+				headers: h,
+				redirect: "manual",
 			});
 
+			// If Roblox redirects, follow ONCE with same headers.
+			if (upstream.status >= 300 && upstream.status < 400) {
+				const loc = upstream.headers.get("location");
+				if (loc) {
+					const nextUrl = new URL(loc, url).toString();
+					console.log(
+						`[Proxy:${requestId}] redirect ${upstream.status} -> ${new URL(nextUrl).host}${new URL(
+							nextUrl
+						).pathname}`
+					);
+
+					const upstream2 = await fetch(nextUrl, {
+						method: "GET",
+						headers: h,
+						redirect: "manual",
+					});
+
+					return await readUpstream(upstream2);
+				}
+			}
+
+			return await readUpstream(upstream);
+		}
+
+		async function readUpstream(upstream) {
 			const upstreamStatus = upstream.status;
 			const upstreamContentType = upstream.headers.get("content-type") || "";
 			const text = await upstream.text();
@@ -133,7 +197,7 @@ export default async function handler(req, res) {
 					const headers = { ...baseHeaders, "x-api-key": openCloudKey.trim() };
 					console.log(`[Proxy:${requestId}] TRY apiKey -> ${safeUpstreamLabel(urlObj)}`);
 
-					result = await doFetch(headers);
+					result = await doFetch(targetUrl, headers);
 
 					console.log(
 						`[Proxy:${requestId}] apiKey status=${result.upstreamStatus} ct=${result.upstreamContentType}`
@@ -148,7 +212,8 @@ export default async function handler(req, res) {
 
 						const headers2 = {
 							...baseHeaders,
-							Cookie: rbxCookie,
+							// IMPORTANT: use lowercase 'cookie' for consistency with fetch/Headers
+							cookie: rbxCookie,
 						};
 
 						console.log(
@@ -157,7 +222,7 @@ export default async function handler(req, res) {
 							)}`
 						);
 
-						result = await doFetch(headers2);
+						result = await doFetch(targetUrl, headers2);
 
 						console.log(
 							`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
@@ -172,16 +237,14 @@ export default async function handler(req, res) {
 
 					const headers = {
 						...baseHeaders,
-						Cookie: rbxCookie,
+						cookie: rbxCookie,
 					};
 
 					console.log(
-						`[Proxy:${requestId}] TRY cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(
-							urlObj
-						)}`
+						`[Proxy:${requestId}] TRY cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(urlObj)}`
 					);
 
-					result = await doFetch(headers);
+					result = await doFetch(targetUrl, headers);
 
 					console.log(
 						`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
@@ -220,14 +283,14 @@ export default async function handler(req, res) {
 
 				const headers = {
 					...baseHeaders,
-					Cookie: rbxCookie,
+					cookie: rbxCookie,
 				};
 
 				console.log(
 					`[Proxy:${requestId}] TRY cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(urlObj)}`
 				);
 
-				result = await doFetch(headers);
+				result = await doFetch(targetUrl, headers);
 
 				console.log(
 					`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
