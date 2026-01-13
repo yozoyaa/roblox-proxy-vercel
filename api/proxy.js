@@ -1,44 +1,40 @@
 // api/proxy.js
-// Vercel serverless GET proxy for Roblox APIs (safe host allowlist)
+// Vercel serverless GET proxy for Roblox APIs (safe allowlist + auth strategy)
 //
-// TODO implemented:
-// 1) If apis.roblox.com returns 403 using apiKey, retry using cookie.
-// 2) Add logs (console.log) so Vercel shows request logs.
+// Auth strategies:
+// - HYBRID_HOSTS: try API key first, if 403 then fallback to cookie
+// - COOKIE_ONLY_HOSTS: cookie only
 //
 // Env vars (Vercel):
 // - ROBLOX_OPEN_CLOUD_KEY      (API key value)
 // - ROBLOX_SECURITY_COOKIE     (cookie value only, WITHOUT ".ROBLOSECURITY=" prefix)
 //
-// Response is ALWAYS JSON:
-// {
-//   ok: boolean,
-//   upstreamStatus: number,
-//   upstreamContentType: string,
-//   json: object|null,
-//   text: string,
-//   error?: string,
-//   authSent: { method: "apiKey"|"cookie"|"none", tried: string[], cookieLen: number }
-// }
+// Response is ALWAYS JSON.
 
-const ALLOWED_HOSTS = [
-	"games.roblox.com",
+const HYBRID_HOSTS = [
 	"apis.roblox.com",
+  "inventory.roblox.com",
+];
+
+const COOKIE_ONLY_HOSTS = [
+	"games.roblox.com",
 	"users.roblox.com",
 	"thumbnails.roblox.com",
 	"catalog.roblox.com",
 ];
+
+// Allowlist = union of both
+const ALLOWED_HOSTS = Array.from(new Set([...HYBRID_HOSTS, ...COOKIE_ONLY_HOSTS]));
 
 function truthy(s) {
 	return typeof s === "string" && s.trim() !== "";
 }
 
 function safeUpstreamLabel(urlObj) {
-	// Don’t print full query; keep logs readable
 	return `${urlObj.host}${urlObj.pathname}`;
 }
 
 export default async function handler(req, res) {
-	// Prevent caching (helps ensure logs always show per request)
 	res.setHeader("Cache-Control", "no-store");
 
 	const requestId =
@@ -123,8 +119,11 @@ export default async function handler(req, res) {
 		let fetchError = null;
 
 		try {
-			if (urlObj.host === "apis.roblox.com") {
-				// 1) Try API key first
+			const isHybrid = HYBRID_HOSTS.includes(urlObj.host);
+			const isCookieOnly = COOKIE_ONLY_HOSTS.includes(urlObj.host);
+
+			if (isHybrid) {
+				// Try API key first (if available)
 				if (truthy(openCloudKey)) {
 					tried.push("apiKey");
 					usedMethod = "apiKey";
@@ -138,7 +137,7 @@ export default async function handler(req, res) {
 						`[Proxy:${requestId}] apiKey status=${result.upstreamStatus} ct=${result.upstreamContentType}`
 					);
 
-					// 2) If 403, fallback to cookie (if present)
+					// If 403, fallback to cookie (if available)
 					if (result.upstreamStatus === 403 && truthy(rbxCookie)) {
 						tried.push("cookie");
 						usedMethod = "cookie";
@@ -164,7 +163,7 @@ export default async function handler(req, res) {
 						);
 					}
 				} else if (truthy(rbxCookie)) {
-					// No API key available, go cookie directly
+					// No API key, go cookie directly
 					tried.push("cookie");
 					usedMethod = "cookie";
 
@@ -188,7 +187,7 @@ export default async function handler(req, res) {
 						`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
 					);
 				} else {
-					console.log(`[Proxy:${requestId}] No auth available for apis.roblox.com`);
+					console.log(`[Proxy:${requestId}] No auth available for hybrid host`);
 					return res.status(200).json({
 						ok: false,
 						upstreamStatus: 0,
@@ -199,8 +198,8 @@ export default async function handler(req, res) {
 						authSent: { method: "none", tried, cookieLen: 0 },
 					});
 				}
-			} else {
-				// Non-apis.roblox.com -> cookie only (original behavior)
+			} else if (isCookieOnly) {
+				// Cookie only
 				if (!truthy(rbxCookie)) {
 					console.log(`[Proxy:${requestId}] Missing cookie for ${urlObj.host}`);
 					return res.status(200).json({
@@ -234,6 +233,10 @@ export default async function handler(req, res) {
 				console.log(
 					`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
 				);
+			} else {
+				// Should never happen (ALLOWED_HOSTS is union), but keep safe
+				console.log(`[Proxy:${requestId}] 403 Host not configured: ${urlObj.host}`);
+				return res.status(403).json({ ok: false, error: "Host not configured" });
 			}
 		} catch (e) {
 			fetchError = String(e);
