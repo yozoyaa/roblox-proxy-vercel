@@ -37,42 +37,49 @@ export default async function handler(req, res) {
       return res.status(403).json({ ok: false, error: "Host not allowed" });
     }
 
-    // Add Open Cloud API key ONLY on the server
     const openCloudKey = process.env.ROBLOX_OPEN_CLOUD_KEY;
+    const rbxCookie = process.env.ROBLOX_SECURITY_COOKIE;
 
     const headers = {
       "Accept": "application/json",
+      // Some Roblox infra behaves better with a UA:
+      "User-Agent": "vercel-proxy/1.0",
     };
 
-    // Only attach x-api-key for apis.roblox.com Open Cloud endpoints
+    // Attach auth ONLY for apis.roblox.com (where your failing endpoint lives)
     if (urlObj.host === "apis.roblox.com") {
-      if (!openCloudKey) {
-        return res.status(500).json({ ok: false, error: "Missing ROBLOX_OPEN_CLOUD_KEY env var" });
+      if (openCloudKey) {
+        headers["x-api-key"] = openCloudKey;
       }
-      headers["x-api-key"] = openCloudKey;
+
+      if (rbxCookie) {
+        // IMPORTANT: cookie header must be exactly formatted like this:
+        headers["Cookie"] = `.ROBLOSECURITY=${rbxCookie}`;
+      }
     }
 
     const upstream = await fetch(targetUrl, {
       method: "GET",
       headers,
+      redirect: "follow",
     });
 
-    const body = await upstream.text();
+    const bodyText = await upstream.text();
 
-    // Pass through status + body
+    // Pass through status
     res.status(upstream.status);
 
-    // Try to return JSON if possible
+    // Try JSON if possible
     const contentType = upstream.headers.get("content-type") || "";
     if (contentType.includes("application/json")) {
       try {
-        return res.json(JSON.parse(body));
+        return res.json(JSON.parse(bodyText));
       } catch {
-        // fall through
+        // If Roblox returns JSON but parsing fails, still return raw
       }
     }
 
-    return res.send(body);
+    return res.send(bodyText);
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err) });
   }
