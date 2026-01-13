@@ -13,7 +13,6 @@
 
 const HYBRID_HOSTS = [
 	"apis.roblox.com",
-  "inventory.roblox.com",
 ];
 
 const COOKIE_ONLY_HOSTS = [
@@ -21,6 +20,7 @@ const COOKIE_ONLY_HOSTS = [
 	"users.roblox.com",
 	"thumbnails.roblox.com",
 	"catalog.roblox.com",
+  "inventory.roblox.com",
 ];
 
 // Allowlist = union of both
