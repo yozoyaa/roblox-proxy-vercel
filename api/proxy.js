@@ -1,31 +1,22 @@
 // api/proxy.js
-// Vercel serverless GET proxy for Roblox APIs (safe allowlist + auth strategy)
-//
-// Auth strategies:
-// - HYBRID_HOSTS: try API key first, if 403 then fallback to cookie
-// - COOKIE_ONLY_HOSTS: cookie only
+// Vercel serverless GET proxy for Roblox APIs (safe allowlist + always-send auth)
 //
 // Env vars (Vercel):
 // - ROBLOX_OPEN_CLOUD_KEY      (API key value)
-// - ROBLOX_SECURITY_COOKIE     (cookie value only)
+// - ROBLOX_SECURITY_COOKIE     (cookie value only; can be ".ROBLOSECURITY=..." or token only)
 //
 // Response is ALWAYS JSON.
 
-// Force Node runtime (prevents Edge runtimes stripping Cookie header in fetch)
 export const config = { runtime: "nodejs" };
 
-const HYBRID_HOSTS = ["apis.roblox.com"];
-
-const COOKIE_ONLY_HOSTS = [
+const ALLOWED_HOSTS = [
 	"games.roblox.com",
+	"apis.roblox.com",
 	"users.roblox.com",
 	"thumbnails.roblox.com",
 	"catalog.roblox.com",
 	"inventory.roblox.com",
 ];
-
-// Allowlist = union of both
-const ALLOWED_HOSTS = Array.from(new Set([...HYBRID_HOSTS, ...COOKIE_ONLY_HOSTS]));
 
 function truthy(s) {
 	return typeof s === "string" && s.trim() !== "";
@@ -35,14 +26,12 @@ function safeUpstreamLabel(urlObj) {
 	return `${urlObj.host}${urlObj.pathname}`;
 }
 
-// Important: Vercel env pastes often include quotes/newlines.
-// Roblox requires a valid cookie pair in the Cookie header.
 function normalizeRobloxCookie(raw) {
 	if (typeof raw !== "string") return "";
 
 	let s = raw.trim();
 
-	// strip wrapping quotes (common when pasting into env UI)
+	// strip wrapping quotes (common in env UI)
 	if (
 		(s.startsWith('"') && s.endsWith('"')) ||
 		(s.startsWith("'") && s.endsWith("'"))
@@ -50,10 +39,10 @@ function normalizeRobloxCookie(raw) {
 		s = s.slice(1, -1).trim();
 	}
 
-	// remove ALL whitespace (spaces/newlines/tabs) which can break cookie parsing
+	// remove ALL whitespace (spaces/newlines/tabs) that can break cookie parsing
 	s = s.replace(/\s+/g, "").trim();
 
-	// allow storing token-only; we’ll prefix it
+	// allow storing token-only; prefix it
 	if (!s.includes("ROBLOSECURITY=")) {
 		s = `.ROBLOSECURITY=${s}`;
 	}
@@ -70,6 +59,7 @@ export default async function handler(req, res) {
 			: `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 	try {
+		// Only allow GET
 		if (req.method !== "GET") {
 			res.setHeader("Allow", "GET");
 			console.log(`[Proxy:${requestId}] 405 Method Not Allowed`);
@@ -103,7 +93,7 @@ export default async function handler(req, res) {
 			return res.status(403).json({ ok: false, error: "Host not allowed" });
 		}
 
-		const openCloudKey = process.env.ROBLOX_OPEN_CLOUD_KEY || "";
+		const openCloudKey = (process.env.ROBLOX_OPEN_CLOUD_KEY || "").trim();
 		const rbxCookie = normalizeRobloxCookie(process.env.ROBLOX_SECURITY_COOKIE);
 
 		const baseHeaders = {
@@ -115,13 +105,29 @@ export default async function handler(req, res) {
 		};
 
 		const tried = [];
-		let usedMethod = "none";
 		let sentCookieLen = 0;
 
-		async function doFetch(url, withHeaders) {
-			const h = new Headers(withHeaders);
+		async function readUpstream(upstream) {
+			const upstreamStatus = upstream.status;
+			const upstreamContentType = upstream.headers.get("content-type") || "";
+			const text = await upstream.text();
 
-			// Debug without leaking cookie:
+			let json = null;
+			if (upstreamContentType.includes("application/json") && text) {
+				try {
+					json = JSON.parse(text);
+				} catch {
+					json = null;
+				}
+			}
+
+			return { upstreamStatus, upstreamContentType, text: text || "", json };
+		}
+
+		async function doFetch(url, headersObj) {
+			const h = new Headers(headersObj);
+
+			// Debug (no secrets leaked)
 			const cookieHeader = h.get("cookie") || "";
 			console.log(
 				`[Proxy:${requestId}] outgoing cookieHeaderLen=${cookieHeader.length} hasPair=${cookieHeader.includes(
@@ -129,14 +135,13 @@ export default async function handler(req, res) {
 				)} url=${new URL(url).host}${new URL(url).pathname}`
 			);
 
-			// Use manual redirect so headers (esp Cookie) never get silently lost.
 			const upstream = await fetch(url, {
 				method: "GET",
 				headers: h,
 				redirect: "manual",
 			});
 
-			// If Roblox redirects, follow ONCE with same headers.
+			// follow 1 redirect with same headers
 			if (upstream.status >= 300 && upstream.status < 400) {
 				const loc = upstream.headers.get("location");
 				if (loc) {
@@ -160,169 +165,35 @@ export default async function handler(req, res) {
 			return await readUpstream(upstream);
 		}
 
-		async function readUpstream(upstream) {
-			const upstreamStatus = upstream.status;
-			const upstreamContentType = upstream.headers.get("content-type") || "";
-			const text = await upstream.text();
-
-			let json = null;
-			if (upstreamContentType.includes("application/json") && text) {
-				try {
-					json = JSON.parse(text);
-				} catch {
-					json = null;
-				}
-			}
-
-			return { upstreamStatus, upstreamContentType, text: text || "", json };
-		}
-
 		console.log(
 			`[Proxy:${requestId}] START host=${urlObj.host} path=${safeUpstreamLabel(urlObj)}`
 		);
+		console.log(
+			`[Proxy:${requestId}] env openCloudKeyLen=${openCloudKey.length} cookieLen=${rbxCookie.length}`
+		);
 
-		let result = null;
-		let fetchError = null;
+		// Always send both (if present)
+		const headers = { ...baseHeaders };
 
-		try {
-			const isHybrid = HYBRID_HOSTS.includes(urlObj.host);
-			const isCookieOnly = COOKIE_ONLY_HOSTS.includes(urlObj.host);
-
-			if (isHybrid) {
-				// Try API key first (if available)
-				if (truthy(openCloudKey)) {
-					tried.push("apiKey");
-					usedMethod = "apiKey";
-
-					const headers = { ...baseHeaders, "x-api-key": openCloudKey.trim() };
-					console.log(`[Proxy:${requestId}] TRY apiKey -> ${safeUpstreamLabel(urlObj)}`);
-
-					result = await doFetch(targetUrl, headers);
-
-					console.log(
-						`[Proxy:${requestId}] apiKey status=${result.upstreamStatus} ct=${result.upstreamContentType}`
-					);
-
-					// If 403, fallback to cookie (if available)
-					if (result.upstreamStatus === 403 && truthy(rbxCookie)) {
-						tried.push("cookie");
-						usedMethod = "cookie";
-
-						sentCookieLen = rbxCookie.length;
-
-						const headers2 = {
-							...baseHeaders,
-							// IMPORTANT: use lowercase 'cookie' for consistency with fetch/Headers
-							cookie: rbxCookie,
-						};
-
-						console.log(
-							`[Proxy:${requestId}] FALLBACK cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(
-								urlObj
-							)}`
-						);
-
-						result = await doFetch(targetUrl, headers2);
-
-						console.log(
-							`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
-						);
-					}
-				} else if (truthy(rbxCookie)) {
-					// No API key, go cookie directly
-					tried.push("cookie");
-					usedMethod = "cookie";
-
-					sentCookieLen = rbxCookie.length;
-
-					const headers = {
-						...baseHeaders,
-						cookie: rbxCookie,
-					};
-
-					console.log(
-						`[Proxy:${requestId}] TRY cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(urlObj)}`
-					);
-
-					result = await doFetch(targetUrl, headers);
-
-					console.log(
-						`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
-					);
-				} else {
-					console.log(`[Proxy:${requestId}] No auth available for hybrid host`);
-					return res.status(200).json({
-						ok: false,
-						upstreamStatus: 0,
-						upstreamContentType: "",
-						json: null,
-						text: "",
-						error: "Missing ROBLOX_OPEN_CLOUD_KEY and ROBLOX_SECURITY_COOKIE env vars",
-						authSent: { method: "none", tried, cookieLen: 0 },
-					});
-				}
-			} else if (isCookieOnly) {
-				// Cookie only
-				if (!truthy(rbxCookie)) {
-					console.log(`[Proxy:${requestId}] Missing cookie for ${urlObj.host}`);
-					return res.status(200).json({
-						ok: false,
-						upstreamStatus: 0,
-						upstreamContentType: "",
-						json: null,
-						text: "",
-						error: `Missing ROBLOX_SECURITY_COOKIE env var for ${urlObj.host}`,
-						authSent: { method: "none", tried, cookieLen: 0 },
-					});
-				}
-
-				tried.push("cookie");
-				usedMethod = "cookie";
-
-				sentCookieLen = rbxCookie.length;
-
-				const headers = {
-					...baseHeaders,
-					cookie: rbxCookie,
-				};
-
-				console.log(
-					`[Proxy:${requestId}] TRY cookie (len=${sentCookieLen}) -> ${safeUpstreamLabel(urlObj)}`
-				);
-
-				result = await doFetch(targetUrl, headers);
-
-				console.log(
-					`[Proxy:${requestId}] cookie status=${result.upstreamStatus} ct=${result.upstreamContentType}`
-				);
-			} else {
-				// Should never happen (ALLOWED_HOSTS is union), but keep safe
-				console.log(`[Proxy:${requestId}] 403 Host not configured: ${urlObj.host}`);
-				return res.status(403).json({ ok: false, error: "Host not configured" });
-			}
-		} catch (e) {
-			fetchError = String(e);
-			console.error(`[Proxy:${requestId}] FETCH ERROR: ${fetchError}`);
+		if (truthy(openCloudKey)) {
+			tried.push("apiKey");
+			headers["x-api-key"] = openCloudKey;
 		}
 
-		if (!result) {
-			return res.status(200).json({
-				ok: false,
-				upstreamStatus: 0,
-				upstreamContentType: "",
-				json: null,
-				text: "",
-				error: fetchError || "Unknown fetch error",
-				authSent: { method: usedMethod, tried, cookieLen: sentCookieLen },
-			});
+		if (truthy(rbxCookie)) {
+			tried.push("cookie");
+			sentCookieLen = rbxCookie.length;
+
+			// IMPORTANT: use lowercase 'cookie' key
+			headers.cookie = rbxCookie;
 		}
 
-		const ok = fetchError == null && result.upstreamStatus >= 200 && result.upstreamStatus < 300;
+		const result = await doFetch(targetUrl, headers);
+
+		const ok = result.upstreamStatus >= 200 && result.upstreamStatus < 300;
 
 		console.log(
-			`[Proxy:${requestId}] END ok=${ok} status=${result.upstreamStatus} method=${usedMethod} tried=${tried.join(
-				","
-			)}`
+			`[Proxy:${requestId}] END ok=${ok} status=${result.upstreamStatus} tried=${tried.join(",")}`
 		);
 
 		return res.status(200).json({
@@ -331,11 +202,10 @@ export default async function handler(req, res) {
 			upstreamContentType: result.upstreamContentType,
 			json: result.json,
 			text: result.text,
-			error: fetchError || undefined,
 			authSent: {
-				method: usedMethod,
 				tried,
 				cookieLen: sentCookieLen,
+				apiKeyLen: openCloudKey.length,
 			},
 		});
 	} catch (err) {
@@ -347,7 +217,7 @@ export default async function handler(req, res) {
 			json: null,
 			text: "",
 			error: String(err),
-			authSent: { method: "none", tried: [], cookieLen: 0 },
+			authSent: { tried: [], cookieLen: 0, apiKeyLen: 0 },
 		});
 	}
 }
