@@ -1,5 +1,3 @@
-// api/get-donation-asset.js
-
 const DEFAULTS = {
 	includeGamepasses: true,
 	includeClothing: true,
@@ -15,9 +13,7 @@ const DEFAULTS = {
 const INVENTORY_ASSET_TYPES = ["CLASSIC_TSHIRT", "CLASSIC_SHIRT", "CLASSIC_PANTS"]
 const ASSET_LIST_KEYS = ["GAMEPASS", ...INVENTORY_ASSET_TYPES]
 
-// Your deployment has api/fetch-url.js (route: /api/fetch-url).
-// We'll try /api/proxy first, then fallback to /api/fetch-url.
-const PROXY_ROUTE_CANDIDATES = ["/api/proxy", "/api/fetch-url"]
+const PROXY_ROUTE = "/api/fetch-url"
 
 function toInt(value) {
 	if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value)
@@ -154,6 +150,111 @@ function isCatalogForSale(item) {
 	return true
 }
 
+function unwrapProxyWire(parsedValue) {
+	// Expected wire:
+	// { ok: boolean, upstreamStatus: number, upstreamContentType: string, json?: any, text?: string, error?: string }
+	if (!parsedValue || typeof parsedValue !== "object") return { ok: true, body: parsedValue }
+
+	const isWire =
+		typeof parsedValue.ok === "boolean" &&
+		(parsedValue.upstreamStatus != null || parsedValue.upstreamContentType != null)
+
+	if (!isWire) return { ok: true, body: parsedValue }
+
+	const upstreamStatus = typeof parsedValue.upstreamStatus === "string"
+		? Number(parsedValue.upstreamStatus)
+		: parsedValue.upstreamStatus
+
+	const in2xx = Number.isFinite(upstreamStatus) && upstreamStatus >= 200 && upstreamStatus < 300
+	if (!(parsedValue.ok === true && in2xx)) {
+		let snippet = ""
+		if (parsedValue.json != null) {
+			try {
+				snippet = JSON.stringify(parsedValue.json).slice(0, 300)
+			} catch {
+				snippet = String(parsedValue.json).slice(0, 300)
+			}
+		} else if (typeof parsedValue.text === "string") {
+			snippet = parsedValue.text.slice(0, 300)
+		}
+
+		return {
+			ok: false,
+			upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : 0,
+			error: parsedValue.error ? String(parsedValue.error) : "",
+			bodySnippet: snippet,
+		}
+	}
+
+	if (parsedValue.json != null) return { ok: true, body: parsedValue.json }
+
+	if (typeof parsedValue.text === "string") {
+		const parsedText = safeJsonParse(parsedValue.text)
+		return { ok: true, body: parsedText.ok ? parsedText.value : parsedValue.text }
+	}
+
+	return { ok: true, body: null }
+}
+
+async function proxyGet(req, actualUrl, errors, step, context) {
+	const baseUrl = getBaseUrl(req)
+	const proxyUrl = `${baseUrl}${PROXY_ROUTE}?url=${encodeURIComponent(actualUrl)}`
+
+	try {
+		const res = await fetch(proxyUrl, { method: "GET" })
+		const text = await res.text()
+
+		const parsed = safeJsonParse(text)
+		if (!parsed.ok) {
+			errors.push({
+				step,
+				message: "Proxy returned non-JSON response",
+				context: { ...context, status: res.status, proxyUrl, bodySnippet: text.slice(0, 300) },
+			})
+			return null
+		}
+
+		const unwrapped = unwrapProxyWire(parsed.value)
+		if (!unwrapped.ok) {
+			errors.push({
+				step,
+				message: "Upstream error via fetch-url proxy",
+				context: {
+					...context,
+					proxyUrl,
+					upstreamStatus: unwrapped.upstreamStatus,
+					error: unwrapped.error,
+					bodySnippet: unwrapped.bodySnippet,
+				},
+			})
+			return null
+		}
+
+		return unwrapped.body
+	} catch (e) {
+		errors.push({
+			step,
+			message: "Proxy fetch failed",
+			context: { ...context, proxyUrl, error: String(e) },
+		})
+		return null
+	}
+}
+
+// ---- CSRF handling for Catalog POST ----
+let cachedCsrfToken = null
+
+function buildRobloxCookieHeader() {
+	const raw = process.env.ROBLOX_SECURITY_COOKIE
+	if (!raw || typeof raw !== "string" || raw.trim() === "") return null
+
+	// Support both formats:
+	// - raw cookie value only
+	// - full ".ROBLOSECURITY=...." string
+	if (raw.includes(".ROBLOSECURITY=")) return raw
+	return `.ROBLOSECURITY=${raw}`
+}
+
 async function catalogPostItemsDetails(assetIds, errors, userId) {
 	const body = {
 		items: assetIds.map((id) => ({
@@ -162,15 +263,46 @@ async function catalogPostItemsDetails(assetIds, errors, userId) {
 		})),
 	}
 
-	try {
-		const res = await fetch("https://catalog.roblox.com/v1/catalog/items/details", {
+	const cookieHeader = buildRobloxCookieHeader()
+
+	const headers = {
+		"Content-Type": "application/json",
+		"Accept": "application/json",
+	}
+
+	// If you want consistent behavior and access, send cookie if available.
+	if (cookieHeader) {
+		headers.Cookie = cookieHeader
+	}
+
+	if (cachedCsrfToken) {
+		headers["x-csrf-token"] = cachedCsrfToken
+	}
+
+	async function doPost() {
+		return fetch("https://catalog.roblox.com/v1/catalog/items/details", {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers,
 			body: JSON.stringify(body),
 		})
+	}
+
+	try {
+		let res = await doPost()
+
+		// If CSRF is required, Roblox returns 403 + x-csrf-token header.
+		if (res.status === 403) {
+			const newToken = res.headers.get("x-csrf-token")
+			if (newToken && newToken !== cachedCsrfToken) {
+				cachedCsrfToken = newToken
+				headers["x-csrf-token"] = newToken
+				res = await doPost()
+			}
+		}
 
 		const text = await res.text()
 		const parsed = safeJsonParse(text)
+
 		if (!parsed.ok) {
 			errors.push({
 				step: "catalog.details",
@@ -185,7 +317,7 @@ async function catalogPostItemsDetails(assetIds, errors, userId) {
 			errors.push({
 				step: "catalog.details",
 				message: "Catalog response missing data[]",
-				context: { userId, response: parsed.value },
+				context: { userId, status: res.status, response: parsed.value },
 			})
 			return null
 		}
@@ -199,131 +331,6 @@ async function catalogPostItemsDetails(assetIds, errors, userId) {
 		})
 		return null
 	}
-}
-
-function unwrapProxyBody(parsedValue) {
-	// Supports proxy wire format:
-	// { ok, upstreamStatus, upstreamContentType, json, text, error }
-	if (!parsedValue || typeof parsedValue !== "object") return { kind: "direct", body: parsedValue }
-
-	const hasWire =
-		typeof parsedValue.ok === "boolean" &&
-		(typeof parsedValue.upstreamStatus === "number" || typeof parsedValue.upstreamStatus === "string")
-
-	if (!hasWire) {
-		return { kind: "direct", body: parsedValue }
-	}
-
-	const upstreamStatus = typeof parsedValue.upstreamStatus === "string"
-		? Number(parsedValue.upstreamStatus)
-		: parsedValue.upstreamStatus
-
-	const ok = parsedValue.ok === true && Number.isFinite(upstreamStatus) && upstreamStatus >= 200 && upstreamStatus < 300
-
-	if (ok) {
-		if (parsedValue.json != null) return { kind: "wire_ok", body: parsedValue.json, upstreamStatus }
-		if (typeof parsedValue.text === "string") {
-			const parsedText = safeJsonParse(parsedValue.text)
-			return { kind: "wire_ok", body: parsedText.ok ? parsedText.value : parsedValue.text, upstreamStatus }
-		}
-		return { kind: "wire_ok", body: null, upstreamStatus }
-	}
-
-	// Not ok
-	let snippet = ""
-	if (parsedValue.json != null) {
-		try {
-			snippet = JSON.stringify(parsedValue.json).slice(0, 300)
-		} catch {
-			snippet = String(parsedValue.json).slice(0, 300)
-		}
-	} else if (typeof parsedValue.text === "string") {
-		snippet = parsedValue.text.slice(0, 300)
-	}
-
-	return {
-		kind: "wire_err",
-		upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : 0,
-		error: parsedValue.error ? String(parsedValue.error) : "",
-		snippet,
-	}
-}
-
-async function proxyGet(req, actualUrl, errors, step, context) {
-	const baseUrl = getBaseUrl(req)
-
-	let last404Text = ""
-	let last404Status = 404
-
-	for (const routePath of PROXY_ROUTE_CANDIDATES) {
-		const proxyUrl = `${baseUrl}${routePath}?url=${encodeURIComponent(actualUrl)}`
-
-		try {
-			const res = await fetch(proxyUrl, { method: "GET" })
-			const text = await res.text()
-
-			// If this proxy route doesn't exist, try the next candidate.
-			if (res.status === 404) {
-				last404Text = text
-				last404Status = res.status
-				continue
-			}
-
-			const parsed = safeJsonParse(text)
-			if (!parsed.ok) {
-				errors.push({
-					step,
-					message: "Proxy returned non-JSON response",
-					context: { ...context, status: res.status, proxyRoute: routePath, bodySnippet: text.slice(0, 300) },
-				})
-				return null
-			}
-
-			const unwrapped = unwrapProxyBody(parsed.value)
-
-			if (unwrapped.kind === "wire_ok") {
-				return unwrapped.body
-			}
-
-			if (unwrapped.kind === "wire_err") {
-				errors.push({
-					step,
-					message: "Upstream error via proxy",
-					context: {
-						...context,
-						proxyRoute: routePath,
-						upstreamStatus: unwrapped.upstreamStatus,
-						bodySnippet: unwrapped.snippet,
-						error: unwrapped.error,
-					},
-				})
-				return null
-			}
-
-			// direct JSON (if your proxy returns upstream JSON directly)
-			return unwrapped.body
-		} catch (e) {
-			errors.push({
-				step,
-				message: "Proxy fetch failed",
-				context: { ...context, proxyRoute: routePath, error: String(e) },
-			})
-			return null
-		}
-	}
-
-	// If we get here, BOTH /api/proxy and /api/fetch-url were 404.
-	errors.push({
-		step,
-		message: "Proxy route not found (404)",
-		context: {
-			...context,
-			tried: PROXY_ROUTE_CANDIDATES,
-			status: last404Status,
-			bodySnippet: String(last404Text || "").slice(0, 300),
-		},
-	})
-	return null
 }
 
 export default async function handler(req, res) {
@@ -447,7 +454,11 @@ export default async function handler(req, res) {
 								`?passView=Full&pageSize=${pageSize}` +
 								(pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "")
 
-							const gpJson = await proxyGet(req, url, errors, "gamepasses.list", { userId, universeId, page })
+							const gpJson = await proxyGet(req, url, errors, "gamepasses.list", {
+								userId,
+								universeId,
+								page,
+							})
 							if (!gpJson) return
 
 							const passes = Array.isArray(gpJson?.gamePasses) ? gpJson.gamePasses : []
@@ -462,7 +473,9 @@ export default async function handler(req, res) {
 
 								const name =
 									(typeof gp?.name === "string" && gp.name.trim() !== "" && gp.name) ||
-									(typeof gp?.displayName === "string" && gp.displayName.trim() !== "" && gp.displayName) ||
+									(typeof gp?.displayName === "string" &&
+										gp.displayName.trim() !== "" &&
+										gp.displayName) ||
 									`Game Pass ${gpId}`
 
 								seenGamepassIds.add(gpId)
