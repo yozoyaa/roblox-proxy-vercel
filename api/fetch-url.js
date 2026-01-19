@@ -1,4 +1,4 @@
-// api/proxy.js
+// api/fetch-url.js
 // Vercel serverless GET proxy for Roblox APIs (safe allowlist + always-send auth)
 //
 // Env vars (Vercel):
@@ -7,94 +7,119 @@
 //
 // Response is ALWAYS JSON.
 
-export const config = { runtime: "nodejs" };
+export const config = { runtime: "nodejs" }
 
 const ALLOWED_HOSTS = [
-	"games.roblox.com",
 	"apis.roblox.com",
-	"users.roblox.com",
-	"thumbnails.roblox.com",
+	"accountinformation.roblox.com",
+	"accountsettings.roblox.com",
+	"adconfiguration.roblox.com",
+	"assetdelivery.roblox.com",
+	"auth.roblox.com",
+	"avatar.roblox.com",
+	"badges.roblox.com",
 	"catalog.roblox.com",
+	"clientsettings.roblox.com",
+	"contacts.roblox.com",
+	"develop.roblox.com",
+	"economy.roblox.com",
+	"economycreatorstats.roblox.com",
+	"engagementpayouts.roblox.com",
+	"followings.roblox.com",
+	"friends.roblox.com",
+	"gameinternationalization.roblox.com",
+	"games.roblox.com",
+	"groups.roblox.com",
 	"inventory.roblox.com",
-];
+	"itemconfiguration.roblox.com",
+	"locale.roblox.com",
+	"localizationtables.roblox.com",
+	"notifications.roblox.com",
+	"premiumfeatures.roblox.com",
+	"presence.roblox.com",
+	"privatemessages.roblox.com",
+	"publish.roblox.com",
+	"thumbnails.roblox.com",
+	"thumbnailsresizer.roblox.com",
+	"users.roblox.com",
+]
 
 function truthy(s) {
-	return typeof s === "string" && s.trim() !== "";
+	return typeof s === "string" && s.trim() !== ""
 }
 
 function safeUpstreamLabel(urlObj) {
-	return `${urlObj.host}${urlObj.pathname}`;
+	return `${urlObj.host}${urlObj.pathname}`
 }
 
 function normalizeRobloxCookie(raw) {
-	if (typeof raw !== "string") return "";
+	if (typeof raw !== "string") return ""
 
-	let s = raw.trim();
+	let s = raw.trim()
 
 	// strip wrapping quotes (common in env UI)
 	if (
 		(s.startsWith('"') && s.endsWith('"')) ||
 		(s.startsWith("'") && s.endsWith("'"))
 	) {
-		s = s.slice(1, -1).trim();
+		s = s.slice(1, -1).trim()
 	}
 
 	// remove ALL whitespace (spaces/newlines/tabs) that can break cookie parsing
-	s = s.replace(/\s+/g, "").trim();
+	s = s.replace(/\s+/g, "").trim()
 
 	// allow storing token-only; prefix it
 	if (!s.includes("ROBLOSECURITY=")) {
-		s = `.ROBLOSECURITY=${s}`;
+		s = `.ROBLOSECURITY=${s}`
 	}
 
-	return s;
+	return s
 }
 
 export default async function handler(req, res) {
-	res.setHeader("Cache-Control", "no-store");
+	res.setHeader("Cache-Control", "no-store")
 
 	const requestId =
 		typeof crypto !== "undefined" && crypto.randomUUID
 			? crypto.randomUUID()
-			: `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+			: `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
 	try {
-		// Only allow GET
 		if (req.method !== "GET") {
-			res.setHeader("Allow", "GET");
-			console.log(`[Proxy:${requestId}] 405 Method Not Allowed`);
-			return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+			res.setHeader("Allow", "GET")
+			console.log(`[Proxy:${requestId}] 405 Method Not Allowed`)
+			return res.status(405).json({ ok: false, error: "Method Not Allowed" })
 		}
 
-		const target = req.query.url;
+		const target = req.query.url
 		if (!target) {
-			console.log(`[Proxy:${requestId}] 400 Missing url param`);
-			return res.status(400).json({ ok: false, error: "Missing 'url' query parameter" });
+			console.log(`[Proxy:${requestId}] 400 Missing url param`)
+			return res.status(400).json({ ok: false, error: "Missing 'url' query parameter" })
 		}
 
-		let targetUrl;
+		let targetUrl
 		try {
-			targetUrl = decodeURIComponent(target);
+			targetUrl = decodeURIComponent(target)
 		} catch {
-			console.log(`[Proxy:${requestId}] 400 Invalid URL encoding`);
-			return res.status(400).json({ ok: false, error: "Invalid URL encoding" });
+			console.log(`[Proxy:${requestId}] 400 Invalid URL encoding`)
+			return res.status(400).json({ ok: false, error: "Invalid URL encoding" })
 		}
 
-		let urlObj;
+		let urlObj
 		try {
-			urlObj = new URL(targetUrl);
+			urlObj = new URL(targetUrl)
 		} catch {
-			console.log(`[Proxy:${requestId}] 400 Invalid URL format`);
-			return res.status(400).json({ ok: false, error: "Invalid URL format" });
+			console.log(`[Proxy:${requestId}] 400 Invalid URL format`)
+			return res.status(400).json({ ok: false, error: "Invalid URL format" })
 		}
 
 		if (!ALLOWED_HOSTS.includes(urlObj.host)) {
-			console.log(`[Proxy:${requestId}] 403 Host not allowed: ${urlObj.host}`);
-			return res.status(403).json({ ok: false, error: "Host not allowed" });
+			console.log(`[Proxy:${requestId}] 403 Host not allowed: ${urlObj.host}`)
+			return res.status(403).json({ ok: false, error: "Host not allowed" })
 		}
 
-		const openCloudKey = (process.env.ROBLOX_OPEN_CLOUD_KEY || "").trim();
-		const rbxCookie = normalizeRobloxCookie(process.env.ROBLOX_SECURITY_COOKIE);
+		const openCloudKey = (process.env.ROBLOX_OPEN_CLOUD_KEY || "").trim()
+		const rbxCookie = normalizeRobloxCookie(process.env.ROBLOX_SECURITY_COOKIE)
 
 		const baseHeaders = {
 			Accept: "application/json",
@@ -102,99 +127,97 @@ export default async function handler(req, res) {
 				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 				"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 			Referer: "https://www.roblox.com/",
-		};
+		}
 
-		const tried = [];
-		let sentCookieLen = 0;
+		const tried = []
+		let sentCookieLen = 0
 
 		async function readUpstream(upstream) {
-			const upstreamStatus = upstream.status;
-			const upstreamContentType = upstream.headers.get("content-type") || "";
-			const text = await upstream.text();
+			const upstreamStatus = upstream.status
+			const upstreamContentType = upstream.headers.get("content-type") || ""
+			const text = await upstream.text()
 
-			let json = null;
+			let json = null
 			if (upstreamContentType.includes("application/json") && text) {
 				try {
-					json = JSON.parse(text);
+					json = JSON.parse(text)
 				} catch {
-					json = null;
+					json = null
 				}
 			}
 
-			return { upstreamStatus, upstreamContentType, text: text || "", json };
+			return { upstreamStatus, upstreamContentType, text: text || "", json }
 		}
 
 		async function doFetch(url, headersObj) {
-			const h = new Headers(headersObj);
+			const h = new Headers(headersObj)
 
 			// Debug (no secrets leaked)
-			const cookieHeader = h.get("cookie") || "";
+			const cookieHeader = h.get("cookie") || ""
 			console.log(
 				`[Proxy:${requestId}] outgoing cookieHeaderLen=${cookieHeader.length} hasPair=${cookieHeader.includes(
 					"ROBLOSECURITY="
 				)} url=${new URL(url).host}${new URL(url).pathname}`
-			);
+			)
 
 			const upstream = await fetch(url, {
 				method: "GET",
 				headers: h,
 				redirect: "manual",
-			});
+			})
 
 			// follow 1 redirect with same headers
 			if (upstream.status >= 300 && upstream.status < 400) {
-				const loc = upstream.headers.get("location");
+				const loc = upstream.headers.get("location")
 				if (loc) {
-					const nextUrl = new URL(loc, url).toString();
+					const nextUrl = new URL(loc, url).toString()
 					console.log(
 						`[Proxy:${requestId}] redirect ${upstream.status} -> ${new URL(nextUrl).host}${new URL(
 							nextUrl
 						).pathname}`
-					);
+					)
 
 					const upstream2 = await fetch(nextUrl, {
 						method: "GET",
 						headers: h,
 						redirect: "manual",
-					});
+					})
 
-					return await readUpstream(upstream2);
+					return await readUpstream(upstream2)
 				}
 			}
 
-			return await readUpstream(upstream);
+			return await readUpstream(upstream)
 		}
 
 		console.log(
 			`[Proxy:${requestId}] START host=${urlObj.host} path=${safeUpstreamLabel(urlObj)}`
-		);
+		)
 		console.log(
 			`[Proxy:${requestId}] env openCloudKeyLen=${openCloudKey.length} cookieLen=${rbxCookie.length}`
-		);
+		)
 
 		// Always send both (if present)
-		const headers = { ...baseHeaders };
+		const headers = { ...baseHeaders }
 
 		if (truthy(openCloudKey)) {
-			tried.push("apiKey");
-			headers["x-api-key"] = openCloudKey;
+			tried.push("apiKey")
+			headers["x-api-key"] = openCloudKey
 		}
 
 		if (truthy(rbxCookie)) {
-			tried.push("cookie");
-			sentCookieLen = rbxCookie.length;
-
-			// IMPORTANT: use lowercase 'cookie' key
-			headers.cookie = rbxCookie;
+			tried.push("cookie")
+			sentCookieLen = rbxCookie.length
+			headers.cookie = rbxCookie
 		}
 
-		const result = await doFetch(targetUrl, headers);
+		const result = await doFetch(targetUrl, headers)
 
-		const ok = result.upstreamStatus >= 200 && result.upstreamStatus < 300;
+		const ok = result.upstreamStatus >= 200 && result.upstreamStatus < 300
 
 		console.log(
 			`[Proxy:${requestId}] END ok=${ok} status=${result.upstreamStatus} tried=${tried.join(",")}`
-		);
+		)
 
 		return res.status(200).json({
 			ok,
@@ -207,9 +230,9 @@ export default async function handler(req, res) {
 				cookieLen: sentCookieLen,
 				apiKeyLen: openCloudKey.length,
 			},
-		});
+		})
 	} catch (err) {
-		console.error(`[Proxy:${requestId}] HANDLER ERROR:`, err);
+		console.error(`[Proxy:${requestId}] HANDLER ERROR:`, err)
 		return res.status(200).json({
 			ok: false,
 			upstreamStatus: 0,
@@ -218,6 +241,6 @@ export default async function handler(req, res) {
 			text: "",
 			error: String(err),
 			authSent: { tried: [], cookieLen: 0, apiKeyLen: 0 },
-		});
+		})
 	}
 }
