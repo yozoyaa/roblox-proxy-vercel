@@ -1,3 +1,5 @@
+// api/get-donation-asset.js
+
 const DEFAULTS = {
 	includeGamepasses: true,
 	includeClothing: true,
@@ -12,6 +14,10 @@ const DEFAULTS = {
 
 const INVENTORY_ASSET_TYPES = ["CLASSIC_TSHIRT", "CLASSIC_SHIRT", "CLASSIC_PANTS"]
 const ASSET_LIST_KEYS = ["GAMEPASS", ...INVENTORY_ASSET_TYPES]
+
+// Your deployment has api/fetch-url.js (route: /api/fetch-url).
+// We'll try /api/proxy first, then fallback to /api/fetch-url.
+const PROXY_ROUTE_CANDIDATES = ["/api/proxy", "/api/fetch-url"]
 
 function toInt(value) {
 	if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value)
@@ -76,35 +82,6 @@ function getBaseUrl(req) {
 	return `${proto}://${host}`
 }
 
-async function proxyGet(req, actualUrl, errors, step, context) {
-	const baseUrl = getBaseUrl(req)
-	const proxyUrl = `${baseUrl}/api/proxy?url=${encodeURIComponent(actualUrl)}`
-
-	try {
-		const res = await fetch(proxyUrl, { method: "GET" })
-		const text = await res.text()
-
-		const parsed = safeJsonParse(text)
-		if (!parsed.ok) {
-			errors.push({
-				step,
-				message: "Proxy returned non-JSON response",
-				context: { ...context, status: res.status, bodySnippet: text.slice(0, 300) },
-			})
-			return null
-		}
-
-		return parsed.value
-	} catch (e) {
-		errors.push({
-			step,
-			message: "Proxy fetch failed",
-			context: { ...context, error: String(e) },
-		})
-		return null
-	}
-}
-
 function getNextPageToken(obj) {
 	const t = obj?.nextPageToken
 	if (t == null) return null
@@ -144,8 +121,7 @@ function parseGroupOwnerUserId(groupObj) {
 }
 
 function normalizeCatalogCreatorType(creatorTypeRaw) {
-	// Endpoint historically returns string ("User"/"Group") in the wild,
-	// but you also shared a schema where it can be numeric.
+	// Can be string or number depending on Roblox service behavior
 	if (typeof creatorTypeRaw === "string") {
 		const s = creatorTypeRaw.trim().toLowerCase()
 		if (s === "group") return "Group"
@@ -154,10 +130,9 @@ function normalizeCatalogCreatorType(creatorTypeRaw) {
 	}
 
 	if (typeof creatorTypeRaw === "number" && Number.isFinite(creatorTypeRaw)) {
-		// Common Roblox pattern: 1 = User, 2 = Group (search APIs use this).
+		// Common Roblox convention: 1=User, 2=Group
 		if (creatorTypeRaw === 2) return "Group"
 		if (creatorTypeRaw === 1) return "User"
-		// Unknown (0/other) => caller may probe group endpoint if needed.
 		return "Unknown"
 	}
 
@@ -165,15 +140,12 @@ function normalizeCatalogCreatorType(creatorTypeRaw) {
 }
 
 function isCatalogForSale(item) {
-	// Per your schema: priceStatus, isOffSale, price
-	// We treat "for sale" as: not offsale + price is finite > 0
 	if (!item || typeof item !== "object") return false
 	if (item.isOffSale === true) return false
 
 	const price = parseRobuxPrice(item.price)
 	if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) return false
 
-	// If priceStatus exists and explicitly indicates offsale, respect it
 	if (typeof item.priceStatus === "string") {
 		const ps = item.priceStatus.trim().toLowerCase()
 		if (ps === "offsale") return false
@@ -183,8 +155,6 @@ function isCatalogForSale(item) {
 }
 
 async function catalogPostItemsDetails(assetIds, errors, userId) {
-	// POST https://catalog.roblox.com/v1/catalog/items/details
-	// Body: { items: [ { itemType: 1, id: <assetId> } ] }
 	const body = {
 		items: assetIds.map((id) => ({
 			itemType: 1,
@@ -229,6 +199,131 @@ async function catalogPostItemsDetails(assetIds, errors, userId) {
 		})
 		return null
 	}
+}
+
+function unwrapProxyBody(parsedValue) {
+	// Supports proxy wire format:
+	// { ok, upstreamStatus, upstreamContentType, json, text, error }
+	if (!parsedValue || typeof parsedValue !== "object") return { kind: "direct", body: parsedValue }
+
+	const hasWire =
+		typeof parsedValue.ok === "boolean" &&
+		(typeof parsedValue.upstreamStatus === "number" || typeof parsedValue.upstreamStatus === "string")
+
+	if (!hasWire) {
+		return { kind: "direct", body: parsedValue }
+	}
+
+	const upstreamStatus = typeof parsedValue.upstreamStatus === "string"
+		? Number(parsedValue.upstreamStatus)
+		: parsedValue.upstreamStatus
+
+	const ok = parsedValue.ok === true && Number.isFinite(upstreamStatus) && upstreamStatus >= 200 && upstreamStatus < 300
+
+	if (ok) {
+		if (parsedValue.json != null) return { kind: "wire_ok", body: parsedValue.json, upstreamStatus }
+		if (typeof parsedValue.text === "string") {
+			const parsedText = safeJsonParse(parsedValue.text)
+			return { kind: "wire_ok", body: parsedText.ok ? parsedText.value : parsedValue.text, upstreamStatus }
+		}
+		return { kind: "wire_ok", body: null, upstreamStatus }
+	}
+
+	// Not ok
+	let snippet = ""
+	if (parsedValue.json != null) {
+		try {
+			snippet = JSON.stringify(parsedValue.json).slice(0, 300)
+		} catch {
+			snippet = String(parsedValue.json).slice(0, 300)
+		}
+	} else if (typeof parsedValue.text === "string") {
+		snippet = parsedValue.text.slice(0, 300)
+	}
+
+	return {
+		kind: "wire_err",
+		upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : 0,
+		error: parsedValue.error ? String(parsedValue.error) : "",
+		snippet,
+	}
+}
+
+async function proxyGet(req, actualUrl, errors, step, context) {
+	const baseUrl = getBaseUrl(req)
+
+	let last404Text = ""
+	let last404Status = 404
+
+	for (const routePath of PROXY_ROUTE_CANDIDATES) {
+		const proxyUrl = `${baseUrl}${routePath}?url=${encodeURIComponent(actualUrl)}`
+
+		try {
+			const res = await fetch(proxyUrl, { method: "GET" })
+			const text = await res.text()
+
+			// If this proxy route doesn't exist, try the next candidate.
+			if (res.status === 404) {
+				last404Text = text
+				last404Status = res.status
+				continue
+			}
+
+			const parsed = safeJsonParse(text)
+			if (!parsed.ok) {
+				errors.push({
+					step,
+					message: "Proxy returned non-JSON response",
+					context: { ...context, status: res.status, proxyRoute: routePath, bodySnippet: text.slice(0, 300) },
+				})
+				return null
+			}
+
+			const unwrapped = unwrapProxyBody(parsed.value)
+
+			if (unwrapped.kind === "wire_ok") {
+				return unwrapped.body
+			}
+
+			if (unwrapped.kind === "wire_err") {
+				errors.push({
+					step,
+					message: "Upstream error via proxy",
+					context: {
+						...context,
+						proxyRoute: routePath,
+						upstreamStatus: unwrapped.upstreamStatus,
+						bodySnippet: unwrapped.snippet,
+						error: unwrapped.error,
+					},
+				})
+				return null
+			}
+
+			// direct JSON (if your proxy returns upstream JSON directly)
+			return unwrapped.body
+		} catch (e) {
+			errors.push({
+				step,
+				message: "Proxy fetch failed",
+				context: { ...context, proxyRoute: routePath, error: String(e) },
+			})
+			return null
+		}
+	}
+
+	// If we get here, BOTH /api/proxy and /api/fetch-url were 404.
+	errors.push({
+		step,
+		message: "Proxy route not found (404)",
+		context: {
+			...context,
+			tried: PROXY_ROUTE_CANDIDATES,
+			status: last404Status,
+			bodySnippet: String(last404Text || "").slice(0, 300),
+		},
+	})
+	return null
 }
 
 export default async function handler(req, res) {
@@ -288,20 +383,15 @@ export default async function handler(req, res) {
 			100
 		)
 
-		let pageSize = Number.isFinite(toInt(req.query.pageSize))
-			? toInt(req.query.pageSize)
-			: DEFAULTS.pageSize
+		let pageSize = Number.isFinite(toInt(req.query.pageSize)) ? toInt(req.query.pageSize) : DEFAULTS.pageSize
 		pageSize = clamp(pageSize, 1, 100)
 
 		const limiter = createLimiter(DEFAULTS.concurrency)
 
-		// Data: AssetList (keys are strings)
 		const data = {}
 		for (const key of ASSET_LIST_KEYS) data[key] = {}
 
-		// -----------------------------
-		// A) List games -> rootPlace.id
-		// -----------------------------
+		// A) games -> placeIds
 		const gamesUrl = `https://games.roblox.com/v2/users/${userId}/games?sortOrder=Asc&limit=50`
 		const gamesJson = await proxyGet(req, gamesUrl, errors, "games.list", { userId })
 
@@ -315,9 +405,7 @@ export default async function handler(req, res) {
 		const placeIds = Array.from(new Set(placeIdsRaw)).slice(0, maxPlaces)
 		out.summary.places = placeIds.length
 
-		// -----------------------------
-		// B) placeId -> universeId (concurrency limited)
-		// -----------------------------
+		// B) place -> universe
 		const universeIdSet = new Set()
 		await Promise.all(
 			placeIds.map((placeId) =>
@@ -327,6 +415,7 @@ export default async function handler(req, res) {
 						userId,
 						placeId,
 					})
+
 					const universeId = uniJson?.universeId
 					if (typeof universeId === "number" && Number.isFinite(universeId)) {
 						universeIdSet.add(universeId)
@@ -344,9 +433,7 @@ export default async function handler(req, res) {
 		const universeIds = Array.from(universeIdSet)
 		out.summary.universes = universeIds.length
 
-		// -----------------------------
-		// C) Gamepasses per universe (NO details endpoint)
-		// -----------------------------
+		// C) gamepasses
 		if (includeGamepasses) {
 			const seenGamepassIds = new Set()
 
@@ -360,11 +447,7 @@ export default async function handler(req, res) {
 								`?passView=Full&pageSize=${pageSize}` +
 								(pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "")
 
-							const gpJson = await proxyGet(req, url, errors, "gamepasses.list", {
-								userId,
-								universeId,
-								page,
-							})
+							const gpJson = await proxyGet(req, url, errors, "gamepasses.list", { userId, universeId, page })
 							if (!gpJson) return
 
 							const passes = Array.isArray(gpJson?.gamePasses) ? gpJson.gamePasses : []
@@ -372,7 +455,6 @@ export default async function handler(req, res) {
 								const gpId = gp?.id
 								if (typeof gpId !== "number" || !Number.isFinite(gpId)) continue
 								if (seenGamepassIds.has(gpId)) continue
-
 								if (gp?.isForSale !== true) continue
 
 								const price = parseRobuxPrice(gp?.price)
@@ -395,9 +477,7 @@ export default async function handler(req, res) {
 			)
 		}
 
-		// -----------------------------
-		// D) Inventory items (Cloud v2) assetIds for classic clothing types
-		// -----------------------------
+		// D/E) inventory + catalog enrich
 		if (includeClothing) {
 			const assetsByType = {
 				CLASSIC_TSHIRT: new Set(),
@@ -408,7 +488,6 @@ export default async function handler(req, res) {
 			for (const assetType of INVENTORY_ASSET_TYPES) {
 				let pageToken = null
 				for (let page = 0; page < maxInventoryPages; page += 1) {
-					// filter param value must be: "inventoryItemAssetTypes=<ASSET_TYPE>"
 					const filterValue = `inventoryItemAssetTypes=${assetType}`
 					const url =
 						`https://apis.roblox.com/cloud/v2/users/${userId}/inventory-items` +
@@ -416,11 +495,7 @@ export default async function handler(req, res) {
 						`&filter=${encodeURIComponent(filterValue)}` +
 						(pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "")
 
-					const invJson = await proxyGet(req, url, errors, "inventory.list", {
-						userId,
-						assetType,
-						page,
-					})
+					const invJson = await proxyGet(req, url, errors, "inventory.list", { userId, assetType, page })
 					if (!invJson) break
 
 					const items = Array.isArray(invJson?.inventoryItems) ? invJson.inventoryItems : []
@@ -428,9 +503,7 @@ export default async function handler(req, res) {
 						const rawAssetId = it?.assetDetails?.assetId
 						if (typeof rawAssetId !== "string" || rawAssetId.trim() === "") continue
 						const assetId = Number(rawAssetId)
-						if (Number.isFinite(assetId) && assetId > 0) {
-							assetsByType[assetType].add(assetId)
-						}
+						if (Number.isFinite(assetId) && assetId > 0) assetsByType[assetType].add(assetId)
 					}
 
 					pageToken = getNextPageToken(invJson)
@@ -438,9 +511,6 @@ export default async function handler(req, res) {
 				}
 			}
 
-			// -----------------------------
-			// E) Catalog batch details + filtering (for sale + price > 0 + creator rules)
-			// -----------------------------
 			const allAssetIds = Array.from(
 				new Set([
 					...assetsByType.CLASSIC_TSHIRT,
@@ -450,13 +520,11 @@ export default async function handler(req, res) {
 			)
 
 			if (allAssetIds.length > 0) {
-				// assetId -> preferred inventory type key
 				const assetTypeLookup = new Map()
 				for (const id of assetsByType.CLASSIC_TSHIRT) assetTypeLookup.set(id, "CLASSIC_TSHIRT")
 				for (const id of assetsByType.CLASSIC_SHIRT) assetTypeLookup.set(id, "CLASSIC_SHIRT")
 				for (const id of assetsByType.CLASSIC_PANTS) assetTypeLookup.set(id, "CLASSIC_PANTS")
 
-				// Cache for group owner lookups
 				const groupOwnerCache = new Map()
 
 				async function getGroupOwner(groupId) {
@@ -464,7 +532,6 @@ export default async function handler(req, res) {
 
 					const url = `https://apis.roblox.com/cloud/v2/groups/${groupId}`
 					const gJson = await proxyGet(req, url, errors, "groups.get", { userId, groupId })
-
 					const ownerUserId = gJson ? parseGroupOwnerUserId(gJson) : null
 					groupOwnerCache.set(groupId, ownerUserId)
 					return ownerUserId
@@ -483,22 +550,21 @@ export default async function handler(req, res) {
 
 						const invKey = assetTypeLookup.get(assetId)
 						if (!invKey) continue
-
 						if (!isCatalogForSale(item)) continue
 
 						const price = parseRobuxPrice(item.price)
 						if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) continue
 
 						const name =
-							(typeof item?.name === "string" && item.name.trim() !== "" && item.name) ||
-							`Asset ${assetId}`
+							(typeof item?.name === "string" && item.name.trim() !== "" && item.name) || `Asset ${assetId}`
 
 						const creatorTargetId = item?.creatorTargetId
 						const creatorTypeNorm = normalizeCatalogCreatorType(item?.creatorType)
 
+						const typeId = invKey === "CLASSIC_TSHIRT" ? 2 : invKey === "CLASSIC_SHIRT" ? 11 : 12
+
 						if (creatorTypeNorm === "User") {
 							if (Number(creatorTargetId) !== userId) continue
-							const typeId = invKey === "CLASSIC_TSHIRT" ? 2 : invKey === "CLASSIC_SHIRT" ? 11 : 12
 							data[invKey][String(assetId)] = makeAssetEntry(name, invKey, typeId, price)
 						} else if (creatorTypeNorm === "Group") {
 							const groupId = Number(creatorTargetId)
@@ -508,50 +574,34 @@ export default async function handler(req, res) {
 								limiter(async () => {
 									const ownerUserId = await getGroupOwner(groupId)
 									if (ownerUserId === userId) {
-										const typeId =
-											invKey === "CLASSIC_TSHIRT" ? 2 : invKey === "CLASSIC_SHIRT" ? 11 : 12
 										data[invKey][String(assetId)] = makeAssetEntry(name, invKey, typeId, price)
 									}
 								})
 							)
 						} else if (creatorTypeNorm === "Unknown") {
-							// Schema mismatch / unknown enum value:
-							// Try treating creatorTargetId as group first (probe), otherwise fall back to User.
 							const maybeId = Number(creatorTargetId)
+							if (!Number.isFinite(maybeId) || maybeId <= 0) continue
 
-							if (Number.isFinite(maybeId) && maybeId > 0) {
-								groupChecks.push(
-									limiter(async () => {
-										const ownerUserId = await getGroupOwner(maybeId)
-										if (ownerUserId != null) {
-											// It was a real group
-											if (ownerUserId === userId) {
-												const typeId =
-													invKey === "CLASSIC_TSHIRT"
-														? 2
-														: invKey === "CLASSIC_SHIRT"
-															? 11
-															: 12
-												data[invKey][String(assetId)] = makeAssetEntry(name, invKey, typeId, price)
-											}
-											return
-										}
-
-										// Not a group (or not readable) -> treat as User
-										if (maybeId === userId) {
-											const typeId =
-												invKey === "CLASSIC_TSHIRT" ? 2 : invKey === "CLASSIC_SHIRT" ? 11 : 12
+							groupChecks.push(
+								limiter(async () => {
+									const ownerUserId = await getGroupOwner(maybeId)
+									if (ownerUserId != null) {
+										if (ownerUserId === userId) {
 											data[invKey][String(assetId)] = makeAssetEntry(name, invKey, typeId, price)
 										}
-									})
-								)
-							}
+										return
+									}
+
+									// Not a group (or not readable) -> treat as User
+									if (maybeId === userId) {
+										data[invKey][String(assetId)] = makeAssetEntry(name, invKey, typeId, price)
+									}
+								})
+							)
 						}
 					}
 
-					if (groupChecks.length > 0) {
-						await Promise.all(groupChecks)
-					}
+					if (groupChecks.length > 0) await Promise.all(groupChecks)
 				}
 			}
 		}
