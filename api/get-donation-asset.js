@@ -106,6 +106,7 @@ function safeJsonParse(text) {
 	}
 }
 
+// Simple concurrency limiter (no deps)
 function createLimiter(limit) {
 	let active = 0
 	const queue = []
@@ -222,9 +223,11 @@ function parseRetryAfterMs(headers) {
 	const raw = headers.get("retry-after")
 	if (!raw) return null
 
+	// "Retry-After: 2" (seconds)
 	const asInt = Number(raw)
 	if (Number.isFinite(asInt) && asInt > 0) return clampInt(asInt * 1000, 0, RETRY_MAX_DELAY_MS)
 
+	// "Retry-After: Wed, 21 Oct 2015 07:28:00 GMT"
 	const asDate = Date.parse(raw)
 	if (Number.isFinite(asDate)) {
 		const diff = asDate - Date.now()
@@ -246,7 +249,6 @@ function getRateLimitInfo(headers) {
 }
 
 function computeBackoffMs(attemptIndex, retryAfterMs) {
-	// attemptIndex: 1 for first retry, 2 for second retry, etc.
 	if (typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
 		return clampInt(retryAfterMs, 0, RETRY_MAX_DELAY_MS)
 	}
@@ -272,7 +274,7 @@ function makeLogger(requestId) {
 function getSnippet(text) {
 	return String(text || "")
 		.slice(0, 180)
-		.replace(/\s+/g, " ")
+		replace(/\s+/g, " ")
 		.trim()
 }
 
@@ -324,13 +326,11 @@ async function catalogPostItemsDetails(
 		const start = Date.now()
 
 		try {
-			// First try: use token if we have it, otherwise no token
 			const existing = getCsrfToken()
 			let res = await doPost(existing || null)
 			let text = await res.text()
 			let ms = Date.now() - start
 
-			// CSRF refresh flow: 403 -> look for x-csrf-token header -> retry once
 			if (res.status === 403) {
 				const newToken = res.headers.get("x-csrf-token")
 
@@ -341,8 +341,7 @@ async function catalogPostItemsDetails(
 					text = await res.text()
 					ms = Date.now() - start
 				} else if (existing && isXsrfInvalidBody(text)) {
-					// Sometimes body says invalid but header is missing (rare).
-					// Try a bootstrap request with NO token to obtain a fresh header.
+					// rare: invalid body but header missing
 					setCsrfToken(null)
 					log.warn(`CSRF step=catalog.details invalid_token_bootstrap status=403 ms=${ms}`)
 
@@ -360,7 +359,6 @@ async function catalogPostItemsDetails(
 						if (finalRes.status >= 200 && finalRes.status < 300) {
 							const parsedFinal = safeJsonParse(finalText)
 							const dataFinal = parsedFinal.ok ? parsedFinal.value?.data : null
-
 							if (Array.isArray(dataFinal)) return dataFinal
 
 							errors.push({
@@ -371,14 +369,11 @@ async function catalogPostItemsDetails(
 							return null
 						}
 
-						// fall through to normal error handling using finalRes/finalText
 						res = finalRes
 						text = finalText
 						ms = Date.now() - start
 					} else {
-						// bootstrap failed; keep original res/text
-						log.warn(`CSRF step=catalog.details bootstrap_failed status=${bootRes.status}`)
-						// keep res/text/ms from initial attempt
+						log.warn(`CSRF step=catalog.details bootstrap_failed status=${bootRes.status} snippet="${getSnippet(bootText)}"`)
 					}
 				}
 			}
@@ -388,9 +383,7 @@ async function catalogPostItemsDetails(
 				metrics.upstreamNon2xx += 1
 				if (res.status === 429) metrics.upstream429 += 1
 
-				log.warn(
-					`FAIL step=catalog.details status=${res.status} ms=${ms} snippet="${getSnippet(text)}"`
-				)
+				log.warn(`FAIL step=catalog.details status=${res.status} ms=${ms} snippet="${getSnippet(text)}"`)
 
 				if (isRetryableStatus(res.status) && attempt < MAX_ATTEMPTS) {
 					const retryAfterMs = parseRetryAfterMs(res.headers)
@@ -453,8 +446,7 @@ async function catalogPostItemsDetails(
 				const waitMs = computeBackoffMs(attempt, null)
 				metrics.upstreamRetries += 1
 				log.warn(
-					`RETRY step=catalog.details reason=${isAbort ? "timeout" : "network"} attempt=${attempt}/${MAX_ATTEMPTS} ` +
-						`wait=${waitMs}ms error="${String(e)}"`
+					`RETRY step=catalog.details reason=${isAbort ? "timeout" : "network"} attempt=${attempt}/${MAX_ATTEMPTS} wait=${waitMs}ms error="${String(e)}"`
 				)
 				await sleep(waitMs)
 				continue
@@ -568,13 +560,11 @@ export default async function handler(req, res) {
 		function buildAuthHeaders() {
 			const headers = { ...baseHeaders }
 
-			// Always send both if present
 			if (truthy(openCloudKey)) {
 				headers["x-api-key"] = openCloudKey
 			}
 
 			if (truthy(rbxCookie)) {
-				// Use "Cookie" casing for compatibility
 				headers.Cookie = rbxCookie
 			}
 
@@ -693,7 +683,11 @@ export default async function handler(req, res) {
 					const result = await fetchTextOnce(url)
 
 					if (result.redirectBlocked) {
-						errors.push({ step, message: "Redirect host not allowed", context: { ...context, ...result.redirectBlocked } })
+						errors.push({
+							step,
+							message: "Redirect host not allowed",
+							context: { ...context, ...result.redirectBlocked },
+						})
 						log.warn(`FAIL step=${step} reason=redirect_host_not_allowed host=${result.redirectBlocked.host}`)
 						return null
 					}
@@ -848,7 +842,9 @@ export default async function handler(req, res) {
 
 								const name =
 									(typeof gp?.name === "string" && gp.name.trim() !== "" && gp.name) ||
-									(typeof gp?.displayName === "string" && gp.displayName.trim() !== "" && gp.displayName) ||
+									(typeof gp?.displayName === "string" &&
+										gp.displayName.trim() !== "" &&
+										gp.displayName) ||
 									`Game Pass ${gpId}`
 
 								seenGamepassIds.add(gpId)
@@ -863,8 +859,31 @@ export default async function handler(req, res) {
 			)
 		}
 
-		// D/E) inventory + catalog enrich
+		// --- NEW: inventory visibility check (gate clothing pipeline) ---
+		let canViewInventory = true
 		if (includeClothing) {
+			const canViewUrl = `https://apis.roblox.com/cloud/v2/users/${userId}/inventory-items?maxPageSize=1`
+			const canViewJson = await robloxGetJson(canViewUrl, "inventory.canView", { userId })
+
+			// If API returns the tiny schema: { canView: boolean }
+			if (canViewJson && typeof canViewJson.canView === "boolean") {
+				canViewInventory = canViewJson.canView
+			} else if (canViewJson && Array.isArray(canViewJson.inventoryItems)) {
+				// Some responses may already be the normal inventory schema -> treat as viewable
+				canViewInventory = true
+			} else if (canViewJson == null) {
+				// robloxGetJson already recorded an error; skip clothing to avoid more failures
+				canViewInventory = false
+			} else {
+				// unknown shape, but we don't want to block clothing unexpectedly
+				canViewInventory = true
+			}
+
+			log.info(`inventory.canView=${canViewInventory}`)
+		}
+
+		// D/E) inventory + catalog enrich
+		if (includeClothing && canViewInventory) {
 			const assetsByType = {
 				CLASSIC_TSHIRT: new Set(),
 				CLASSIC_SHIRT: new Set(),
@@ -991,7 +1010,6 @@ export default async function handler(req, res) {
 										return
 									}
 
-									// Not a group (or not readable) -> treat as User
 									if (maybeId === userId) {
 										data[invKey][String(assetId)] = makeAssetEntry(name, invKey, typeId, price)
 									}
@@ -1003,6 +1021,9 @@ export default async function handler(req, res) {
 					if (groupChecks.length > 0) await Promise.all(groupChecks)
 				}
 			}
+		} else if (includeClothing && !canViewInventory) {
+			// Not an error: user inventory is private / not viewable
+			log.info("SKIP clothing: inventory not viewable (canView=false)")
 		}
 
 		out.Data = data
