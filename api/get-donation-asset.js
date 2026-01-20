@@ -1,3 +1,5 @@
+export const config = { runtime: "nodejs" }
+
 const DEFAULTS = {
 	includeGamepasses: true,
 	includeClothing: true,
@@ -13,7 +15,54 @@ const DEFAULTS = {
 const INVENTORY_ASSET_TYPES = ["CLASSIC_TSHIRT", "CLASSIC_SHIRT", "CLASSIC_PANTS"]
 const ASSET_LIST_KEYS = ["GAMEPASS", ...INVENTORY_ASSET_TYPES]
 
-const PROXY_ROUTE = "/api/fetch-url"
+const ALLOWED_HOSTS = [
+	"apis.roblox.com",
+	"catalog.roblox.com",
+	"games.roblox.com",
+]
+
+const UPSTREAM_DELAY_MIN_MS = 200
+const UPSTREAM_DELAY_MAX_MS = 300
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function getUpstreamDelayMs() {
+	return UPSTREAM_DELAY_MIN_MS + Math.floor(Math.random() * (UPSTREAM_DELAY_MAX_MS - UPSTREAM_DELAY_MIN_MS + 1))
+}
+
+function truthy(s) {
+	return typeof s === "string" && s.trim() !== ""
+}
+
+function safeUpstreamLabel(urlObj) {
+	return `${urlObj.host}${urlObj.pathname}`
+}
+
+function normalizeRobloxCookie(raw) {
+	if (typeof raw !== "string") return ""
+
+	let s = raw.trim()
+
+	// strip wrapping quotes (common in env UI)
+	if (
+		(s.startsWith('"') && s.endsWith('"')) ||
+		(s.startsWith("'") && s.endsWith("'"))
+	) {
+		s = s.slice(1, -1).trim()
+	}
+
+	// remove ALL whitespace (spaces/newlines/tabs) that can break cookie parsing
+	s = s.replace(/\s+/g, "").trim()
+
+	// allow storing token-only; prefix it
+	if (s !== "" && !s.includes("ROBLOSECURITY=")) {
+		s = `.ROBLOSECURITY=${s}`
+	}
+
+	return s
+}
 
 function toInt(value) {
 	if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value)
@@ -45,7 +94,6 @@ function safeJsonParse(text) {
 	}
 }
 
-// Simple concurrency limiter (no deps)
 function createLimiter(limit) {
 	let active = 0
 	const queue = []
@@ -70,12 +118,6 @@ function createLimiter(limit) {
 			next()
 		})
 	}
-}
-
-function getBaseUrl(req) {
-	const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim()
-	const host = req.headers.host
-	return `${proto}://${host}`
 }
 
 function getNextPageToken(obj) {
@@ -117,7 +159,6 @@ function parseGroupOwnerUserId(groupObj) {
 }
 
 function normalizeCatalogCreatorType(creatorTypeRaw) {
-	// Can be string or number depending on Roblox service behavior
 	if (typeof creatorTypeRaw === "string") {
 		const s = creatorTypeRaw.trim().toLowerCase()
 		if (s === "group") return "Group"
@@ -126,7 +167,6 @@ function normalizeCatalogCreatorType(creatorTypeRaw) {
 	}
 
 	if (typeof creatorTypeRaw === "number" && Number.isFinite(creatorTypeRaw)) {
-		// Common Roblox convention: 1=User, 2=Group
 		if (creatorTypeRaw === 2) return "Group"
 		if (creatorTypeRaw === 1) return "User"
 		return "Unknown"
@@ -150,112 +190,10 @@ function isCatalogForSale(item) {
 	return true
 }
 
-function unwrapProxyWire(parsedValue) {
-	// Expected wire:
-	// { ok: boolean, upstreamStatus: number, upstreamContentType: string, json?: any, text?: string, error?: string }
-	if (!parsedValue || typeof parsedValue !== "object") return { ok: true, body: parsedValue }
-
-	const isWire =
-		typeof parsedValue.ok === "boolean" &&
-		(parsedValue.upstreamStatus != null || parsedValue.upstreamContentType != null)
-
-	if (!isWire) return { ok: true, body: parsedValue }
-
-	const upstreamStatus = typeof parsedValue.upstreamStatus === "string"
-		? Number(parsedValue.upstreamStatus)
-		: parsedValue.upstreamStatus
-
-	const in2xx = Number.isFinite(upstreamStatus) && upstreamStatus >= 200 && upstreamStatus < 300
-	if (!(parsedValue.ok === true && in2xx)) {
-		let snippet = ""
-		if (parsedValue.json != null) {
-			try {
-				snippet = JSON.stringify(parsedValue.json).slice(0, 300)
-			} catch {
-				snippet = String(parsedValue.json).slice(0, 300)
-			}
-		} else if (typeof parsedValue.text === "string") {
-			snippet = parsedValue.text.slice(0, 300)
-		}
-
-		return {
-			ok: false,
-			upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : 0,
-			error: parsedValue.error ? String(parsedValue.error) : "",
-			bodySnippet: snippet,
-		}
-	}
-
-	if (parsedValue.json != null) return { ok: true, body: parsedValue.json }
-
-	if (typeof parsedValue.text === "string") {
-		const parsedText = safeJsonParse(parsedValue.text)
-		return { ok: true, body: parsedText.ok ? parsedText.value : parsedValue.text }
-	}
-
-	return { ok: true, body: null }
-}
-
-async function proxyGet(req, actualUrl, errors, step, context) {
-	const baseUrl = getBaseUrl(req)
-	const proxyUrl = `${baseUrl}${PROXY_ROUTE}?url=${encodeURIComponent(actualUrl)}`
-
-	try {
-		const res = await fetch(proxyUrl, { method: "GET" })
-		const text = await res.text()
-
-		const parsed = safeJsonParse(text)
-		if (!parsed.ok) {
-			errors.push({
-				step,
-				message: "Proxy returned non-JSON response",
-				context: { ...context, status: res.status, proxyUrl, bodySnippet: text.slice(0, 300) },
-			})
-			return null
-		}
-
-		const unwrapped = unwrapProxyWire(parsed.value)
-		if (!unwrapped.ok) {
-			errors.push({
-				step,
-				message: "Upstream error via fetch-url proxy",
-				context: {
-					...context,
-					proxyUrl,
-					upstreamStatus: unwrapped.upstreamStatus,
-					error: unwrapped.error,
-					bodySnippet: unwrapped.bodySnippet,
-				},
-			})
-			return null
-		}
-
-		return unwrapped.body
-	} catch (e) {
-		errors.push({
-			step,
-			message: "Proxy fetch failed",
-			context: { ...context, proxyUrl, error: String(e) },
-		})
-		return null
-	}
-}
-
 // ---- CSRF handling for Catalog POST ----
 let cachedCsrfToken = null
 
-function buildRobloxCookieHeader() {
-	const raw = process.env.ROBLOX_SECURITY_COOKIE
-	if (!raw || typeof raw !== "string" || raw.trim() === "") return null
-
-	// Support both formats:
-	// - raw cookie value only
-	// - full ".ROBLOSECURITY=...." string
-	if (raw.includes(".ROBLOSECURITY=")) return raw
-	return `.ROBLOSECURITY=${raw}`
-}
-
-async function catalogPostItemsDetails(assetIds, errors, userId) {
+async function catalogPostItemsDetails(assetIds, errors, userId, requestId) {
 	const body = {
 		items: assetIds.map((id) => ({
 			itemType: 1,
@@ -263,16 +201,15 @@ async function catalogPostItemsDetails(assetIds, errors, userId) {
 		})),
 	}
 
-	const cookieHeader = buildRobloxCookieHeader()
+	const rbxCookie = normalizeRobloxCookie(process.env.ROBLOX_SECURITY_COOKIE)
 
 	const headers = {
 		"Content-Type": "application/json",
-		"Accept": "application/json",
+		Accept: "application/json",
 	}
 
-	// If you want consistent behavior and access, send cookie if available.
-	if (cookieHeader) {
-		headers.Cookie = cookieHeader
+	if (truthy(rbxCookie)) {
+		headers.cookie = rbxCookie
 	}
 
 	if (cachedCsrfToken) {
@@ -280,6 +217,8 @@ async function catalogPostItemsDetails(assetIds, errors, userId) {
 	}
 
 	async function doPost() {
+		await sleep(getUpstreamDelayMs())
+
 		return fetch("https://catalog.roblox.com/v1/catalog/items/details", {
 			method: "POST",
 			headers,
@@ -335,6 +274,12 @@ async function catalogPostItemsDetails(assetIds, errors, userId) {
 
 export default async function handler(req, res) {
 	res.setHeader("Content-Type", "application/json; charset=utf-8")
+	res.setHeader("Cache-Control", "no-store")
+
+	const requestId =
+		typeof crypto !== "undefined" && crypto.randomUUID
+			? crypto.randomUUID()
+			: `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
 	const errors = []
 	const out = {
@@ -395,12 +340,150 @@ export default async function handler(req, res) {
 
 		const limiter = createLimiter(DEFAULTS.concurrency)
 
+		const openCloudKey = (process.env.ROBLOX_OPEN_CLOUD_KEY || "").trim()
+		const rbxCookie = normalizeRobloxCookie(process.env.ROBLOX_SECURITY_COOKIE)
+
+		const baseHeaders = {
+			Accept: "application/json",
+			"User-Agent":
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+				"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			Referer: "https://www.roblox.com/",
+		}
+
+		function buildAuthHeaders() {
+			const headers = { ...baseHeaders }
+
+			if (truthy(openCloudKey)) {
+				headers["x-api-key"] = openCloudKey
+			}
+
+			if (truthy(rbxCookie)) {
+				headers.cookie = rbxCookie
+			}
+
+			return headers
+		}
+
+		async function readUpstream(upstream) {
+			const upstreamStatus = upstream.status
+			const upstreamContentType = upstream.headers.get("content-type") || ""
+			const text = await upstream.text()
+			return { upstreamStatus, upstreamContentType, text: text || "" }
+		}
+
+		async function robloxGetJson(url, step, context) {
+			let urlObj
+			try {
+				urlObj = new URL(url)
+			} catch {
+				errors.push({
+					step,
+					message: "Invalid URL format",
+					context: { ...context, url },
+				})
+				return null
+			}
+
+			if (!ALLOWED_HOSTS.includes(urlObj.host)) {
+				errors.push({
+					step,
+					message: "Host not allowed",
+					context: { ...context, host: urlObj.host, url },
+				})
+				return null
+			}
+
+			const headers = buildAuthHeaders()
+
+			try {
+				await sleep(getUpstreamDelayMs())
+
+				console.log(`[GetDonationAsset:${requestId}] GET host=${urlObj.host} path=${safeUpstreamLabel(urlObj)} step=${step}`)
+
+				const upstream = await fetch(url, {
+					method: "GET",
+					headers,
+					redirect: "manual",
+				})
+
+				let result = await readUpstream(upstream)
+
+				if (result.upstreamStatus >= 300 && result.upstreamStatus < 400) {
+					const loc = upstream.headers.get("location")
+					if (loc) {
+						const nextUrl = new URL(loc, url).toString()
+						const nextObj = new URL(nextUrl)
+
+						if (!ALLOWED_HOSTS.includes(nextObj.host)) {
+							errors.push({
+								step,
+								message: "Redirect host not allowed",
+								context: { ...context, from: url, to: nextUrl, host: nextObj.host },
+							})
+							return null
+						}
+
+						await sleep(getUpstreamDelayMs())
+
+						const upstream2 = await fetch(nextUrl, {
+							method: "GET",
+							headers,
+							redirect: "manual",
+						})
+
+						result = await readUpstream(upstream2)
+					}
+				}
+
+				const ok = result.upstreamStatus >= 200 && result.upstreamStatus < 300
+				if (!ok) {
+					errors.push({
+						step,
+						message: "Upstream error",
+						context: {
+							...context,
+							url,
+							upstreamStatus: result.upstreamStatus,
+							bodySnippet: result.text.slice(0, 300),
+						},
+					})
+					return null
+				}
+
+				const parsed = safeJsonParse(result.text)
+				if (!parsed.ok) {
+					errors.push({
+						step,
+						message: "Upstream returned non-JSON response",
+						context: {
+							...context,
+							url,
+							upstreamStatus: result.upstreamStatus,
+							upstreamContentType: result.upstreamContentType,
+							bodySnippet: result.text.slice(0, 300),
+						},
+					})
+					return null
+				}
+
+				return parsed.value
+			} catch (e) {
+				errors.push({
+					step,
+					message: "Upstream fetch failed",
+					context: { ...context, url, error: String(e) },
+				})
+				return null
+			}
+		}
+
 		const data = {}
 		for (const key of ASSET_LIST_KEYS) data[key] = {}
 
 		// A) games -> placeIds
 		const gamesUrl = `https://games.roblox.com/v2/users/${userId}/games?sortOrder=Asc&limit=50`
-		const gamesJson = await proxyGet(req, gamesUrl, errors, "games.list", { userId })
+		const gamesJson = await robloxGetJson(gamesUrl, "games.list", { userId })
 
 		const gamesArr = Array.isArray(gamesJson?.data) ? gamesJson.data : []
 		const placeIdsRaw = []
@@ -418,10 +501,7 @@ export default async function handler(req, res) {
 			placeIds.map((placeId) =>
 				limiter(async () => {
 					const universeUrl = `https://apis.roblox.com/universes/v1/places/${placeId}/universe`
-					const uniJson = await proxyGet(req, universeUrl, errors, "universes.fromPlace", {
-						userId,
-						placeId,
-					})
+					const uniJson = await robloxGetJson(universeUrl, "universes.fromPlace", { userId, placeId })
 
 					const universeId = uniJson?.universeId
 					if (typeof universeId === "number" && Number.isFinite(universeId)) {
@@ -454,11 +534,7 @@ export default async function handler(req, res) {
 								`?passView=Full&pageSize=${pageSize}` +
 								(pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "")
 
-							const gpJson = await proxyGet(req, url, errors, "gamepasses.list", {
-								userId,
-								universeId,
-								page,
-							})
+							const gpJson = await robloxGetJson(url, "gamepasses.list", { userId, universeId, page })
 							if (!gpJson) return
 
 							const passes = Array.isArray(gpJson?.gamePasses) ? gpJson.gamePasses : []
@@ -508,7 +584,7 @@ export default async function handler(req, res) {
 						`&filter=${encodeURIComponent(filterValue)}` +
 						(pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "")
 
-					const invJson = await proxyGet(req, url, errors, "inventory.list", { userId, assetType, page })
+					const invJson = await robloxGetJson(url, "inventory.list", { userId, assetType, page })
 					if (!invJson) break
 
 					const items = Array.isArray(invJson?.inventoryItems) ? invJson.inventoryItems : []
@@ -544,7 +620,7 @@ export default async function handler(req, res) {
 					if (groupOwnerCache.has(groupId)) return groupOwnerCache.get(groupId)
 
 					const url = `https://apis.roblox.com/cloud/v2/groups/${groupId}`
-					const gJson = await proxyGet(req, url, errors, "groups.get", { userId, groupId })
+					const gJson = await robloxGetJson(url, "groups.get", { userId, groupId })
 					const ownerUserId = gJson ? parseGroupOwnerUserId(gJson) : null
 					groupOwnerCache.set(groupId, ownerUserId)
 					return ownerUserId
@@ -552,7 +628,7 @@ export default async function handler(req, res) {
 
 				for (let i = 0; i < allAssetIds.length; i += DEFAULTS.catalogBatchSize) {
 					const batchIds = allAssetIds.slice(i, i + DEFAULTS.catalogBatchSize)
-					const details = await catalogPostItemsDetails(batchIds, errors, userId)
+					const details = await catalogPostItemsDetails(batchIds, errors, userId, requestId)
 					if (!details) continue
 
 					const groupChecks = []
