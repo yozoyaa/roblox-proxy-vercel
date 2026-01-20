@@ -15,14 +15,25 @@ const DEFAULTS = {
 const INVENTORY_ASSET_TYPES = ["CLASSIC_TSHIRT", "CLASSIC_SHIRT", "CLASSIC_PANTS"]
 const ASSET_LIST_KEYS = ["GAMEPASS", ...INVENTORY_ASSET_TYPES]
 
+// Only the hosts this endpoint actually calls
 const ALLOWED_HOSTS = [
 	"apis.roblox.com",
 	"catalog.roblox.com",
 	"games.roblox.com",
 ]
 
+// small jitter to reduce bursts
 const UPSTREAM_DELAY_MIN_MS = 200
 const UPSTREAM_DELAY_MAX_MS = 300
+
+// verbose logs: set Vercel env DEBUG_LOG_ALL=1
+const DEBUG_LOG_ALL = process.env.DEBUG_LOG_ALL === "1"
+
+// retry controls
+const MAX_ATTEMPTS = 4
+const RETRY_BASE_DELAY_MS = 600
+const RETRY_MAX_DELAY_MS = 8000
+const UPSTREAM_TIMEOUT_MS = 15000
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms))
@@ -30,6 +41,10 @@ function sleep(ms) {
 
 function getUpstreamDelayMs() {
 	return UPSTREAM_DELAY_MIN_MS + Math.floor(Math.random() * (UPSTREAM_DELAY_MAX_MS - UPSTREAM_DELAY_MIN_MS + 1))
+}
+
+function clampInt(n, min, max) {
+	return Math.max(min, Math.min(max, Math.trunc(n)))
 }
 
 function truthy(s) {
@@ -45,7 +60,6 @@ function normalizeRobloxCookie(raw) {
 
 	let s = raw.trim()
 
-	// strip wrapping quotes (common in env UI)
 	if (
 		(s.startsWith('"') && s.endsWith('"')) ||
 		(s.startsWith("'") && s.endsWith("'"))
@@ -53,10 +67,8 @@ function normalizeRobloxCookie(raw) {
 		s = s.slice(1, -1).trim()
 	}
 
-	// remove ALL whitespace (spaces/newlines/tabs) that can break cookie parsing
 	s = s.replace(/\s+/g, "").trim()
 
-	// allow storing token-only; prefix it
 	if (s !== "" && !s.includes("ROBLOSECURITY=")) {
 		s = `.ROBLOSECURITY=${s}`
 	}
@@ -94,6 +106,7 @@ function safeJsonParse(text) {
 	}
 }
 
+// Simple concurrency limiter (no deps)
 function createLimiter(limit) {
 	let active = 0
 	const queue = []
@@ -159,6 +172,7 @@ function parseGroupOwnerUserId(groupObj) {
 }
 
 function normalizeCatalogCreatorType(creatorTypeRaw) {
+	// Can be string or number depending on Roblox service behavior
 	if (typeof creatorTypeRaw === "string") {
 		const s = creatorTypeRaw.trim().toLowerCase()
 		if (s === "group") return "Group"
@@ -167,6 +181,7 @@ function normalizeCatalogCreatorType(creatorTypeRaw) {
 	}
 
 	if (typeof creatorTypeRaw === "number" && Number.isFinite(creatorTypeRaw)) {
+		// Common Roblox convention: 1=User, 2=Group
 		if (creatorTypeRaw === 2) return "Group"
 		if (creatorTypeRaw === 1) return "User"
 		return "Unknown"
@@ -190,10 +205,77 @@ function isCatalogForSale(item) {
 	return true
 }
 
+// ---- Retry / timeout helpers ----
+
+function fetchWithTimeout(url, options, timeoutMs) {
+	const controller = new AbortController()
+	const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+	return fetch(url, {
+		...options,
+		signal: controller.signal,
+	}).finally(() => clearTimeout(timer))
+}
+
+function isRetryableStatus(status) {
+	return status === 429 || status === 408 || status === 500 || status === 502 || status === 503 || status === 504
+}
+
+function parseRetryAfterMs(headers) {
+	const raw = headers.get("retry-after")
+	if (!raw) return null
+
+	const asInt = Number(raw)
+	if (Number.isFinite(asInt) && asInt > 0) return clampInt(asInt * 1000, 0, RETRY_MAX_DELAY_MS)
+
+	const asDate = Date.parse(raw)
+	if (Number.isFinite(asDate)) {
+		const diff = asDate - Date.now()
+		if (diff > 0) return clampInt(diff, 0, RETRY_MAX_DELAY_MS)
+	}
+
+	return null
+}
+
+function getRateLimitInfo(headers) {
+	const pick = (name) => headers.get(name) || null
+
+	return {
+		retryAfter: pick("retry-after"),
+		remaining: pick("x-ratelimit-remaining") || pick("x-rate-limit-remaining"),
+		limit: pick("x-ratelimit-limit") || pick("x-rate-limit-limit"),
+		reset: pick("x-ratelimit-reset") || pick("x-rate-limit-reset"),
+	}
+}
+
+function computeBackoffMs(attemptIndex, retryAfterMs) {
+	// attemptIndex: 1 for first retry, 2 for second retry, etc.
+	if (typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+		return clampInt(retryAfterMs, 0, RETRY_MAX_DELAY_MS)
+	}
+
+	const exp = RETRY_BASE_DELAY_MS * Math.pow(2, attemptIndex - 1)
+	const jitter = Math.floor(Math.random() * 250)
+	return clampInt(exp + jitter, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS)
+}
+
+function makeLogger(requestId) {
+	const prefix = `[GetDonationAsset:${requestId}]`
+
+	return {
+		debug: (msg) => {
+			if (DEBUG_LOG_ALL) console.log(`${prefix} ${msg}`)
+		},
+		info: (msg) => console.log(`${prefix} ${msg}`),
+		warn: (msg) => console.warn(`${prefix} ${msg}`),
+		error: (msg) => console.error(`${prefix} ${msg}`),
+	}
+}
+
 // ---- CSRF handling for Catalog POST ----
 let cachedCsrfToken = null
 
-async function catalogPostItemsDetails(assetIds, errors, userId, requestId) {
+async function catalogPostItemsDetails(assetIds, errors, userId, requestId, log, metrics) {
 	const body = {
 		items: assetIds.map((id) => ({
 			itemType: 1,
@@ -212,64 +294,132 @@ async function catalogPostItemsDetails(assetIds, errors, userId, requestId) {
 		headers.cookie = rbxCookie
 	}
 
-	if (cachedCsrfToken) {
-		headers["x-csrf-token"] = cachedCsrfToken
-	}
-
 	async function doPost() {
 		await sleep(getUpstreamDelayMs())
 
-		return fetch("https://catalog.roblox.com/v1/catalog/items/details", {
-			method: "POST",
-			headers,
-			body: JSON.stringify(body),
-		})
+		return fetchWithTimeout(
+			"https://catalog.roblox.com/v1/catalog/items/details",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+			},
+			UPSTREAM_TIMEOUT_MS
+		)
 	}
 
-	try {
-		let res = await doPost()
+	metrics.upstreamCalls += 1
 
-		// If CSRF is required, Roblox returns 403 + x-csrf-token header.
-		if (res.status === 403) {
-			const newToken = res.headers.get("x-csrf-token")
-			if (newToken && newToken !== cachedCsrfToken) {
-				cachedCsrfToken = newToken
-				headers["x-csrf-token"] = newToken
-				res = await doPost()
+	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+		try {
+			const start = Date.now()
+			let res = await doPost()
+
+			// CSRF is required -> 403 + x-csrf-token
+			if (res.status === 403) {
+				const newToken = res.headers.get("x-csrf-token")
+				if (newToken && newToken !== cachedCsrfToken) {
+					cachedCsrfToken = newToken
+					headers["x-csrf-token"] = newToken
+					log.warn(`CSRF step=catalog.details token_refreshed attempt=${attempt}/${MAX_ATTEMPTS}`)
+					res = await doPost()
+				}
 			}
-		}
 
-		const text = await res.text()
-		const parsed = safeJsonParse(text)
+			const ms = Date.now() - start
+			const text = await res.text()
+			const rate = getRateLimitInfo(res.headers)
 
-		if (!parsed.ok) {
+			const ok = res.status >= 200 && res.status < 300
+
+			if (!ok) {
+				metrics.upstreamNon2xx += 1
+				if (res.status === 429) metrics.upstream429 += 1
+
+				const snippet = (text || "").slice(0, 180).replace(/\s+/g, " ").trim()
+				log.warn(`FAIL step=catalog.details status=${res.status} ms=${ms} snippet="${snippet}"`)
+
+				if (isRetryableStatus(res.status) && attempt < MAX_ATTEMPTS) {
+					const retryAfterMs = parseRetryAfterMs(res.headers)
+					const waitMs = computeBackoffMs(attempt, retryAfterMs)
+					metrics.upstreamRetries += 1
+
+					log.warn(
+						`RETRY step=catalog.details status=${res.status} attempt=${attempt}/${MAX_ATTEMPTS} wait=${waitMs}ms ` +
+							`rate={remaining:${rate.remaining ?? "?"}, reset:${rate.reset ?? "?"}}`
+					)
+
+					await sleep(waitMs)
+					continue
+				}
+
+				const parsedFail = safeJsonParse(text || "")
+				errors.push({
+					step: "catalog.details",
+					message: "Catalog upstream error",
+					context: {
+						userId,
+						status: res.status,
+						ms,
+						rateLimit: rate,
+						bodySnippet: (text || "").slice(0, 300),
+						response: parsedFail.ok ? parsedFail.value : undefined,
+					},
+				})
+				return null
+			}
+
+			log.debug(`OK step=catalog.details status=${res.status} ms=${ms} items=${assetIds.length}`)
+
+			const parsed = safeJsonParse(text || "")
+			if (!parsed.ok) {
+				errors.push({
+					step: "catalog.details",
+					message: "Catalog returned non-JSON response",
+					context: { userId, status: res.status, ms, bodySnippet: (text || "").slice(0, 300) },
+				})
+				log.warn(`FAIL step=catalog.details reason=non_json status=${res.status} ms=${ms}`)
+				return null
+			}
+
+			const data = parsed.value?.data
+			if (!Array.isArray(data)) {
+				errors.push({
+					step: "catalog.details",
+					message: "Catalog response missing data[]",
+					context: { userId, status: res.status, ms, response: parsed.value },
+				})
+				log.warn(`FAIL step=catalog.details reason=missing_data status=${res.status} ms=${ms}`)
+				return null
+			}
+
+			return data
+		} catch (e) {
+			const isAbort = String(e && e.name) === "AbortError"
+			const isLast = attempt >= MAX_ATTEMPTS
+
+			if (!isLast) {
+				const waitMs = computeBackoffMs(attempt, null)
+				metrics.upstreamRetries += 1
+				log.warn(
+					`RETRY step=catalog.details reason=${isAbort ? "timeout" : "network"} attempt=${attempt}/${MAX_ATTEMPTS} ` +
+						`wait=${waitMs}ms error="${String(e)}"`
+				)
+				await sleep(waitMs)
+				continue
+			}
+
 			errors.push({
 				step: "catalog.details",
-				message: "Catalog returned non-JSON response",
-				context: { userId, status: res.status, bodySnippet: text.slice(0, 300) },
+				message: "Catalog POST failed",
+				context: { userId, error: String(e) },
 			})
+			log.error(`FAIL step=catalog.details reason=post_failed error="${String(e)}"`)
 			return null
 		}
-
-		const data = parsed.value?.data
-		if (!Array.isArray(data)) {
-			errors.push({
-				step: "catalog.details",
-				message: "Catalog response missing data[]",
-				context: { userId, status: res.status, response: parsed.value },
-			})
-			return null
-		}
-
-		return data
-	} catch (e) {
-		errors.push({
-			step: "catalog.details",
-			message: "Catalog POST failed",
-			context: { userId, error: String(e) },
-		})
-		return null
 	}
+
+	return null
 }
 
 export default async function handler(req, res) {
@@ -280,6 +430,8 @@ export default async function handler(req, res) {
 		typeof crypto !== "undefined" && crypto.randomUUID
 			? crypto.randomUUID()
 			: `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+	const log = makeLogger(requestId)
 
 	const errors = []
 	const out = {
@@ -295,9 +447,22 @@ export default async function handler(req, res) {
 		errors,
 	}
 
+	const metrics = {
+		upstreamCalls: 0,
+		upstreamRetries: 0,
+		upstream429: 0,
+		upstreamNon2xx: 0,
+	}
+
+	const requestStart = Date.now()
+
 	try {
 		if (req.method !== "GET") {
 			errors.push({ step: "validate", message: "Method not allowed (GET only)", context: {} })
+			log.warn("FAIL step=validate reason=method_not_allowed")
+			out.ok = false
+			const totalMs = Date.now() - requestStart
+			log.info(`END ok=false ms=${totalMs} errors=${errors.length}`)
 			return res.status(200).json(out)
 		}
 
@@ -308,6 +473,10 @@ export default async function handler(req, res) {
 				message: "Missing or invalid userId (must be a positive integer)",
 				context: { userId: req.query.userId },
 			})
+			log.warn("FAIL step=validate reason=invalid_userId")
+			out.ok = false
+			const totalMs = Date.now() - requestStart
+			log.info(`END ok=false ms=${totalMs} errors=${errors.length}`)
 			return res.status(200).json(out)
 		}
 		out.userId = userId
@@ -354,6 +523,7 @@ export default async function handler(req, res) {
 		function buildAuthHeaders() {
 			const headers = { ...baseHeaders }
 
+			// Always send both if present
 			if (truthy(openCloudKey)) {
 				headers["x-api-key"] = openCloudKey
 			}
@@ -365,118 +535,208 @@ export default async function handler(req, res) {
 			return headers
 		}
 
-		async function readUpstream(upstream) {
-			const upstreamStatus = upstream.status
-			const upstreamContentType = upstream.headers.get("content-type") || ""
-			const text = await upstream.text()
-			return { upstreamStatus, upstreamContentType, text: text || "" }
-		}
-
 		async function robloxGetJson(url, step, context) {
 			let urlObj
 			try {
 				urlObj = new URL(url)
 			} catch {
-				errors.push({
-					step,
-					message: "Invalid URL format",
-					context: { ...context, url },
-				})
+				const ctx = { ...context, url }
+				errors.push({ step, message: "Invalid URL format", context: ctx })
+				log.warn(`FAIL step=${step} reason=invalid_url`)
 				return null
 			}
 
 			if (!ALLOWED_HOSTS.includes(urlObj.host)) {
-				errors.push({
-					step,
-					message: "Host not allowed",
-					context: { ...context, host: urlObj.host, url },
-				})
+				const ctx = { ...context, host: urlObj.host, url }
+				errors.push({ step, message: "Host not allowed", context: ctx })
+				log.warn(`FAIL step=${step} reason=host_not_allowed host=${urlObj.host}`)
 				return null
 			}
 
 			const headers = buildAuthHeaders()
 
-			try {
+			async function fetchTextOnce(targetUrl) {
 				await sleep(getUpstreamDelayMs())
 
-				console.log(`[GetDonationAsset:${requestId}] GET host=${urlObj.host} path=${safeUpstreamLabel(urlObj)} step=${step}`)
+				const start = Date.now()
+				const upstream = await fetchWithTimeout(
+					targetUrl,
+					{
+						method: "GET",
+						headers,
+						redirect: "manual",
+					},
+					UPSTREAM_TIMEOUT_MS
+				)
 
-				const upstream = await fetch(url, {
-					method: "GET",
-					headers,
-					redirect: "manual",
-				})
-
-				let result = await readUpstream(upstream)
-
-				if (result.upstreamStatus >= 300 && result.upstreamStatus < 400) {
+				// follow 1 redirect with same headers
+				if (upstream.status >= 300 && upstream.status < 400) {
 					const loc = upstream.headers.get("location")
 					if (loc) {
-						const nextUrl = new URL(loc, url).toString()
+						const nextUrl = new URL(loc, targetUrl).toString()
 						const nextObj = new URL(nextUrl)
 
 						if (!ALLOWED_HOSTS.includes(nextObj.host)) {
-							errors.push({
-								step,
-								message: "Redirect host not allowed",
-								context: { ...context, from: url, to: nextUrl, host: nextObj.host },
-							})
-							return null
+							const ms = Date.now() - start
+							return {
+								status: 0,
+								ms,
+								text: "",
+								contentType: "",
+								rate: null,
+								redirectBlocked: { from: targetUrl, to: nextUrl, host: nextObj.host },
+							}
 						}
 
 						await sleep(getUpstreamDelayMs())
 
-						const upstream2 = await fetch(nextUrl, {
-							method: "GET",
-							headers,
-							redirect: "manual",
-						})
+						const upstream2 = await fetchWithTimeout(
+							nextUrl,
+							{
+								method: "GET",
+								headers,
+								redirect: "manual",
+							},
+							UPSTREAM_TIMEOUT_MS
+						)
 
-						result = await readUpstream(upstream2)
+						const text2 = await upstream2.text()
+						return {
+							status: upstream2.status,
+							ms: Date.now() - start,
+							text: text2 || "",
+							contentType: upstream2.headers.get("content-type") || "",
+							rate: getRateLimitInfo(upstream2.headers),
+						}
 					}
 				}
 
-				const ok = result.upstreamStatus >= 200 && result.upstreamStatus < 300
-				if (!ok) {
-					errors.push({
-						step,
-						message: "Upstream error",
-						context: {
-							...context,
-							url,
-							upstreamStatus: result.upstreamStatus,
-							bodySnippet: result.text.slice(0, 300),
-						},
-					})
-					return null
+				const text = await upstream.text()
+				return {
+					status: upstream.status,
+					ms: Date.now() - start,
+					text: text || "",
+					contentType: upstream.headers.get("content-type") || "",
+					rate: getRateLimitInfo(upstream.headers),
 				}
-
-				const parsed = safeJsonParse(result.text)
-				if (!parsed.ok) {
-					errors.push({
-						step,
-						message: "Upstream returned non-JSON response",
-						context: {
-							...context,
-							url,
-							upstreamStatus: result.upstreamStatus,
-							upstreamContentType: result.upstreamContentType,
-							bodySnippet: result.text.slice(0, 300),
-						},
-					})
-					return null
-				}
-
-				return parsed.value
-			} catch (e) {
-				errors.push({
-					step,
-					message: "Upstream fetch failed",
-					context: { ...context, url, error: String(e) },
-				})
-				return null
 			}
+
+			metrics.upstreamCalls += 1
+
+			for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+				const host = urlObj.host
+				const path = safeUpstreamLabel(urlObj)
+
+				try {
+					log.debug(`GET step=${step} attempt=${attempt}/${MAX_ATTEMPTS} host=${host} path=${path}`)
+
+					const result = await fetchTextOnce(url)
+
+					if (result.redirectBlocked) {
+						const ctx = { ...context, ...result.redirectBlocked }
+						errors.push({ step, message: "Redirect host not allowed", context: ctx })
+						log.warn(`FAIL step=${step} reason=redirect_host_not_allowed host=${result.redirectBlocked.host}`)
+						return null
+					}
+
+					const ok = result.status >= 200 && result.status < 300
+
+					if (ok) {
+						log.debug(`OK step=${step} status=${result.status} ms=${result.ms}`)
+					} else {
+						const snippet = result.text.slice(0, 180).replace(/\s+/g, " ").trim()
+						log.warn(`FAIL step=${step} status=${result.status} ms=${result.ms} snippet="${snippet}"`)
+					}
+
+					if (!ok) {
+						metrics.upstreamNon2xx += 1
+						if (result.status === 429) metrics.upstream429 += 1
+
+						if (isRetryableStatus(result.status) && attempt < MAX_ATTEMPTS) {
+							const retryAfterMs =
+								result.rate && typeof result.rate.retryAfter === "string"
+									? parseRetryAfterMs({ get: () => result.rate.retryAfter })
+									: null
+
+							const waitMs = computeBackoffMs(attempt, retryAfterMs)
+							metrics.upstreamRetries += 1
+
+							log.warn(
+								`RETRY step=${step} status=${result.status} attempt=${attempt}/${MAX_ATTEMPTS} wait=${waitMs}ms ` +
+									`rate={remaining:${result.rate?.remaining ?? "?"}, reset:${result.rate?.reset ?? "?"}}`
+							)
+
+							await sleep(waitMs)
+							continue
+						}
+
+						errors.push({
+							step,
+							message: "Upstream error",
+							context: {
+								...context,
+								url,
+								upstreamStatus: result.status,
+								ms: result.ms,
+								rateLimit: result.rate,
+								bodySnippet: result.text.slice(0, 300),
+							},
+						})
+						return null
+					}
+
+					const parsed = safeJsonParse(result.text)
+					if (!parsed.ok) {
+						errors.push({
+							step,
+							message: "Upstream returned non-JSON response",
+							context: {
+								...context,
+								url,
+								upstreamStatus: result.status,
+								ms: result.ms,
+								upstreamContentType: result.contentType,
+								bodySnippet: result.text.slice(0, 300),
+							},
+						})
+						log.warn(`FAIL step=${step} reason=non_json status=${result.status} ms=${result.ms}`)
+						return null
+					}
+
+					return parsed.value
+				} catch (e) {
+					const isAbort = String(e && e.name) === "AbortError"
+					const isLast = attempt >= MAX_ATTEMPTS
+
+					if (!isLast) {
+						const waitMs = computeBackoffMs(attempt, null)
+						metrics.upstreamRetries += 1
+						log.warn(
+							`RETRY step=${step} reason=${isAbort ? "timeout" : "network"} attempt=${attempt}/${MAX_ATTEMPTS} ` +
+								`wait=${waitMs}ms error="${String(e)}"`
+						)
+						await sleep(waitMs)
+						continue
+					}
+
+					errors.push({
+						step,
+						message: "Upstream fetch failed",
+						context: { ...context, url, error: String(e) },
+					})
+					log.error(`FAIL step=${step} reason=fetch_failed error="${String(e)}"`)
+					return null
+				}
+			}
+
+			return null
 		}
+
+		log.info(
+			`START userId=${userId} includeGamepasses=${includeGamepasses} includeClothing=${includeClothing} ` +
+				`concurrency=${DEFAULTS.concurrency} delayMs=${UPSTREAM_DELAY_MIN_MS}-${UPSTREAM_DELAY_MAX_MS} ` +
+				`timeoutMs=${UPSTREAM_TIMEOUT_MS} maxAttempts=${MAX_ATTEMPTS}`
+		)
 
 		const data = {}
 		for (const key of ASSET_LIST_KEYS) data[key] = {}
@@ -512,6 +772,7 @@ export default async function handler(req, res) {
 							message: "Invalid universe response (missing universeId)",
 							context: { userId, placeId, response: uniJson },
 						})
+						log.warn(`FAIL step=universes.fromPlace reason=missing_universeId placeId=${placeId}`)
 					}
 				})
 			)
@@ -628,7 +889,8 @@ export default async function handler(req, res) {
 
 				for (let i = 0; i < allAssetIds.length; i += DEFAULTS.catalogBatchSize) {
 					const batchIds = allAssetIds.slice(i, i + DEFAULTS.catalogBatchSize)
-					const details = await catalogPostItemsDetails(batchIds, errors, userId, requestId)
+
+					const details = await catalogPostItemsDetails(batchIds, errors, userId, requestId, log, metrics)
 					if (!details) continue
 
 					const groupChecks = []
@@ -703,6 +965,16 @@ export default async function handler(req, res) {
 			Object.keys(data.CLASSIC_PANTS).length
 
 		out.ok = errors.length === 0
+
+		const totalMs = Date.now() - requestStart
+		log.info(
+			`END ok=${out.ok} ms=${totalMs} errors=${errors.length} ` +
+				`places=${out.summary.places} universes=${out.summary.universes} ` +
+				`gamepasses=${out.summary.gamepasses} clothing=${out.summary.clothing} ` +
+				`upstreamCalls=${metrics.upstreamCalls} retries=${metrics.upstreamRetries} ` +
+				`429=${metrics.upstream429} non2xx=${metrics.upstreamNon2xx}`
+		)
+
 		return res.status(200).json(out)
 	} catch (e) {
 		errors.push({
@@ -710,7 +982,11 @@ export default async function handler(req, res) {
 			message: "Unhandled server error",
 			context: { error: String(e) },
 		})
+
 		out.ok = false
+		const totalMs = Date.now() - requestStart
+		log.error(`END ok=false reason=fatal ms=${totalMs} error="${String(e)}"`)
+
 		return res.status(200).json(out)
 	}
 }
