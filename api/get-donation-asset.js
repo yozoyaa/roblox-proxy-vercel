@@ -551,11 +551,12 @@ export default async function handler(req, res) {
 
 		const baseHeaders = {
 			Accept: "application/json",
-			"User-Agent":
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-				"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			Referer: "https://www.roblox.com/",
-		}
+		"User-Agent":
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+			"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		Referer: "https://www.roblox.com/",
+		"Cache-Control": "no-cache",
+	}
 
 		function buildAuthHeaders() {
 			const headers = { ...baseHeaders }
@@ -611,24 +612,31 @@ export default async function handler(req, res) {
 				return null
 			}
 
-			const headers = buildAuthHeaders()
+		const headers = buildAuthHeaders()
 
-			async function fetchTextOnce(targetUrl) {
-				await sleep(getUpstreamDelayMs())
+		async function fetchTextOnce(targetUrl) {
+			await sleep(getUpstreamDelayMs())
 
-				const start = Date.now()
-				const upstream = await fetchWithTimeout(
-					targetUrl,
-					{ method: "GET", headers, redirect: "manual" },
-					UPSTREAM_TIMEOUT_MS
-				)
+			const cacheBust = Date.now().toString()
+			const addCacheBuster = (rawUrl) => {
+				const u = new URL(rawUrl)
+				u.searchParams.append("cb", cacheBust)
+				return u.toString()
+			}
+
+			const start = Date.now()
+			const upstream = await fetchWithTimeout(
+				addCacheBuster(targetUrl),
+				{ method: "GET", headers, redirect: "manual", cache: "no-store" },
+				UPSTREAM_TIMEOUT_MS
+			)
 
 				// follow 1 redirect with same headers
 				if (upstream.status >= 300 && upstream.status < 400) {
 					const loc = upstream.headers.get("location")
-					if (loc) {
-						const nextUrl = new URL(loc, targetUrl).toString()
-						const nextObj = new URL(nextUrl)
+				if (loc) {
+					const nextUrl = new URL(loc, targetUrl).toString()
+					const nextObj = new URL(nextUrl)
 
 						if (!ALLOWED_HOSTS.includes(nextObj.host)) {
 							return {
@@ -643,11 +651,11 @@ export default async function handler(req, res) {
 
 						await sleep(getUpstreamDelayMs())
 
-						const upstream2 = await fetchWithTimeout(
-							nextUrl,
-							{ method: "GET", headers, redirect: "manual" },
-							UPSTREAM_TIMEOUT_MS
-						)
+					const upstream2 = await fetchWithTimeout(
+						addCacheBuster(nextUrl),
+						{ method: "GET", headers, redirect: "manual", cache: "no-store" },
+						UPSTREAM_TIMEOUT_MS
+					)
 
 						const text2 = await upstream2.text()
 						return {
