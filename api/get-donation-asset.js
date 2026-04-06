@@ -614,7 +614,7 @@ export default async function handler(req, res) {
 				return null
 			}
 
-		const headers = buildAuthHeaders()
+		const headers = step === "gamepasses.list" ? { ...baseHeaders } : buildAuthHeaders()
 
 		async function fetchTextOnce(targetUrl) {
 			await sleep(getUpstreamDelayMs())
