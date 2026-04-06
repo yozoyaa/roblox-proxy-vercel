@@ -1,4 +1,6 @@
 export const config = { runtime: "nodejs" }
+export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
 
 const DEFAULTS = {
 	includeGamepasses: true,
@@ -627,7 +629,7 @@ export default async function handler(req, res) {
 			const start = Date.now()
 			const upstream = await fetchWithTimeout(
 				addCacheBuster(targetUrl),
-				{ method: "GET", headers, redirect: "manual", cache: "no-store" },
+				{ method: "GET", headers, redirect: "manual", cache: "no-store", next: { revalidate: 0 } },
 				UPSTREAM_TIMEOUT_MS
 			)
 
@@ -653,7 +655,7 @@ export default async function handler(req, res) {
 
 					const upstream2 = await fetchWithTimeout(
 						addCacheBuster(nextUrl),
-						{ method: "GET", headers, redirect: "manual", cache: "no-store" },
+						{ method: "GET", headers, redirect: "manual", cache: "no-store", next: { revalidate: 0 } },
 						UPSTREAM_TIMEOUT_MS
 					)
 
@@ -1051,6 +1053,11 @@ export default async function handler(req, res) {
 				`upstreamCalls=${metrics.upstreamCalls} retries=${metrics.upstreamRetries} ` +
 				`429=${metrics.upstream429} non2xx=${metrics.upstreamNon2xx}`
 		)
+
+		out.debug = {
+			serverTime: new Date().toISOString(),
+			region: process.env.VERCEL_REGION || "local",
+		}
 
 		return res.status(200).json(out)
 	} catch (e) {
