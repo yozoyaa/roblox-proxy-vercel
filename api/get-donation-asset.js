@@ -11,10 +11,15 @@ const DEFAULTS = {
 	pageSize: 100,
 
 	concurrency: 5,
-	catalogBatchSize: 50,
 }
 
 const INVENTORY_ASSET_TYPES = ["CLASSIC_TSHIRT", "CLASSIC_SHIRT", "CLASSIC_PANTS"]
+const CATALOG_SEARCH_SUBCATEGORIES = {
+	CLASSIC_TSHIRT: 55,
+	CLASSIC_SHIRT: 56,
+	CLASSIC_PANTS: 57,
+}
+const CATALOG_SEARCH_LIMIT = 30
 const ASSET_LIST_KEYS = ["GAMEPASS", ...INVENTORY_ASSET_TYPES]
 const SOFT_ERROR = Symbol("soft_error")
 
@@ -221,13 +226,6 @@ function getSnippet(text) {
 		.trim()
 }
 
-function isXsrfInvalidBody(text) {
-	const parsed = safeJsonParse(text || "")
-	if (!parsed.ok) return false
-	const msg = parsed.value?.errors?.[0]?.message
-	return typeof msg === "string" && msg.toLowerCase().includes("xsrf token invalid")
-}
-
 function isSoftInventoryAccessError(status, text) {
 	if (status !== 401 && status !== 403 && status !== 404) return false
 
@@ -239,182 +237,6 @@ function isSoftInventoryAccessError(status, text) {
 		snippet.includes("forbidden") ||
 		snippet.includes("permission")
 	)
-}
-
-async function catalogPostItemsDetails(
-	assetIds,
-	errors,
-	userId,
-	log,
-	metrics,
-	buildCatalogHeaders,
-	getCsrfToken,
-	setCsrfToken
-) {
-	const body = {
-		items: assetIds.map((id) => ({
-			itemType: 1,
-			id,
-		})),
-	}
-
-	async function doPost(csrfTokenOrNull) {
-		await sleep(getUpstreamDelayMs())
-
-		const headers = buildCatalogHeaders(csrfTokenOrNull)
-
-		return fetchWithTimeout(
-			"https://catalog.roblox.com/v1/catalog/items/details",
-			{
-				method: "POST",
-				headers,
-				body: JSON.stringify(body),
-			},
-			UPSTREAM_TIMEOUT_MS
-		)
-	}
-
-	metrics.upstreamCalls += 1
-
-	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-		const start = Date.now()
-
-		try {
-			const existing = getCsrfToken()
-			let res = await doPost(existing || null)
-			let text = await res.text()
-			let ms = Date.now() - start
-
-			if (res.status === 403) {
-				const newToken = res.headers.get("x-csrf-token")
-
-				if (newToken && newToken !== existing) {
-					setCsrfToken(newToken)
-					log.warn(`CSRF step=catalog.details refreshed status=403 ms=${ms}`)
-					res = await doPost(newToken)
-					text = await res.text()
-					ms = Date.now() - start
-				} else if (existing && isXsrfInvalidBody(text)) {
-					setCsrfToken(null)
-					log.warn(`CSRF step=catalog.details invalid_token_bootstrap status=403 ms=${ms}`)
-
-					const bootRes = await doPost(null)
-					const bootText = await bootRes.text()
-					const bootToken = bootRes.headers.get("x-csrf-token")
-
-					if (bootRes.status === 403 && bootToken) {
-						setCsrfToken(bootToken)
-						log.warn(`CSRF step=catalog.details bootstrapped_token status=403`)
-
-						const finalRes = await doPost(bootToken)
-						const finalText = await finalRes.text()
-
-						if (finalRes.status >= 200 && finalRes.status < 300) {
-							const parsedFinal = safeJsonParse(finalText)
-							const dataFinal = parsedFinal.ok ? parsedFinal.value?.data : null
-							if (Array.isArray(dataFinal)) return dataFinal
-
-							errors.push({
-								step: "catalog.details",
-								message: "Catalog response missing data[]",
-								context: { userId, status: finalRes.status, ms: Date.now() - start },
-							})
-							return null
-						}
-
-						res = finalRes
-						text = finalText
-						ms = Date.now() - start
-					} else {
-						log.warn(`CSRF step=catalog.details bootstrap_failed status=${bootRes.status} snippet="${getSnippet(bootText)}"`)
-					}
-				}
-			}
-
-			const ok = res.status >= 200 && res.status < 300
-			if (!ok) {
-				metrics.upstreamNon2xx += 1
-				if (res.status === 429) metrics.upstream429 += 1
-
-				log.warn(`FAIL step=catalog.details status=${res.status} ms=${ms} snippet="${getSnippet(text)}"`)
-
-				if (isRetryableStatus(res.status) && attempt < MAX_ATTEMPTS) {
-					const waitMs = computeBackoffMs(attempt, null)
-					metrics.upstreamRetries += 1
-
-					const rate = getRateLimitInfo(res.headers)
-					log.warn(
-						`RETRY step=catalog.details status=${res.status} attempt=${attempt}/${MAX_ATTEMPTS} wait=${waitMs}ms ` +
-							`rate={remaining:${rate.remaining ?? "?"}, reset:${rate.reset ?? "?"}}`
-					)
-
-					await sleep(waitMs)
-					continue
-				}
-
-				errors.push({
-					step: "catalog.details",
-					message: "Catalog upstream error",
-					context: {
-						userId,
-						status: res.status,
-						ms,
-						rateLimit: getRateLimitInfo(res.headers),
-						bodySnippet: String(text || "").slice(0, 300),
-					},
-				})
-				return null
-			}
-
-			const parsed = safeJsonParse(text)
-			if (!parsed.ok) {
-				errors.push({
-					step: "catalog.details",
-					message: "Catalog returned non-JSON response",
-					context: { userId, status: res.status, ms, bodySnippet: String(text || "").slice(0, 300) },
-				})
-				log.warn(`FAIL step=catalog.details reason=non_json status=${res.status} ms=${ms}`)
-				return null
-			}
-
-			const data = parsed.value?.data
-			if (!Array.isArray(data)) {
-				errors.push({
-					step: "catalog.details",
-					message: "Catalog response missing data[]",
-					context: { userId, status: res.status, ms, response: parsed.value },
-				})
-				log.warn(`FAIL step=catalog.details reason=missing_data status=${res.status} ms=${ms}`)
-				return null
-			}
-
-			log.debug(`OK step=catalog.details status=${res.status} ms=${ms} items=${assetIds.length}`)
-			return data
-		} catch (e) {
-			const isAbort = String(e && e.name) === "AbortError"
-			const isLast = attempt >= MAX_ATTEMPTS
-
-			if (!isLast) {
-				const waitMs = computeBackoffMs(attempt, null)
-				metrics.upstreamRetries += 1
-				log.warn(
-					`RETRY step=catalog.details reason=${isAbort ? "timeout" : "network"} attempt=${attempt}/${MAX_ATTEMPTS} wait=${waitMs}ms error="${String(e)}"`
-				)
-				await sleep(waitMs)
-				continue
-			}
-
-			errors.push({
-				step: "catalog.details",
-				message: "Catalog POST failed",
-				context: { userId, error: String(e) },
-			})
-			log.error(`FAIL step=catalog.details reason=post_failed error="${String(e)}"`)
-			return null
-		}
-	}
-
-	return null
 }
 
 export default async function handler(req, res) {
@@ -519,29 +341,6 @@ export default async function handler(req, res) {
 
 			if (truthy(rbxCookie)) {
 				headers.Cookie = rbxCookie
-			}
-
-			return headers
-		}
-
-		let csrfToken = null
-
-		function buildCatalogHeaders(csrfOrNull) {
-			const headers = {
-				...baseHeaders,
-				"Content-Type": "application/json",
-			}
-
-			if (truthy(openCloudKey)) {
-				headers["x-api-key"] = openCloudKey
-			}
-
-			if (truthy(rbxCookie)) {
-				headers.Cookie = rbxCookie
-			}
-
-			if (truthy(csrfOrNull)) {
-				headers["x-csrf-token"] = csrfOrNull
 			}
 
 			return headers
@@ -753,8 +552,39 @@ export default async function handler(req, res) {
 			)
 		}
 
+		function isCatalogCreatorUser(creatorTypeRaw) {
+			if (typeof creatorTypeRaw === "string") return creatorTypeRaw.trim().toLowerCase() === "user"
+			if (typeof creatorTypeRaw === "number") return creatorTypeRaw === 1
+			return false
+		}
+
+		function isCatalogItemOffSale(item) {
+			if (item?.isOffSale === true) return true
+			if (typeof item?.priceStatus !== "string") return false
+			const s = item.priceStatus.trim().toLowerCase().replace(/\s+/g, "")
+			return s === "offsale"
+		}
+
+		function catalogItemMatchesAssetType(item, assetType) {
+			const expectedTypeId = getClothingAssetTypeId(assetType)
+			const expectedSubcategory = CATALOG_SEARCH_SUBCATEGORIES[assetType]
+
+			if (Number(item?.assetTypeId) === expectedTypeId) return true
+			if (Number(item?.subcategory) === expectedSubcategory || Number(item?.subcategoryId) === expectedSubcategory) return true
+
+			if (typeof item?.assetType === "string") {
+				const s = item.assetType.trim().toLowerCase().replace(/[\s_-]+/g, "")
+				if (assetType === "CLASSIC_TSHIRT" && (s === "classictshirt" || s === "tshirt")) return true
+				if (assetType === "CLASSIC_SHIRT" && (s === "classicshirt" || s === "shirt")) return true
+				if (assetType === "CLASSIC_PANTS" && (s === "classicpants" || s === "pants")) return true
+			}
+
+			// Search is already constrained by subcategory; fall back to accepting the scoped result.
+			return item?.assetTypeId == null && item?.assetType == null && item?.subcategory == null && item?.subcategoryId == null
+		}
+
 		async function collectUserClassicClothingAssets() {
-			const assetsByType = {
+			const inventoryAssetIdsByType = {
 				CLASSIC_TSHIRT: new Set(),
 				CLASSIC_SHIRT: new Set(),
 				CLASSIC_PANTS: new Set(),
@@ -783,7 +613,7 @@ export default async function handler(req, res) {
 					const items = Array.isArray(invJson?.inventoryItems) ? invJson.inventoryItems : []
 					for (const it of items) {
 						const assetId = Number(it?.assetDetails?.assetId)
-						if (Number.isFinite(assetId) && assetId > 0) assetsByType[assetType].add(assetId)
+						if (Number.isFinite(assetId) && assetId > 0) inventoryAssetIdsByType[assetType].add(assetId)
 					}
 
 					pageToken = getNextPageToken(invJson)
@@ -791,53 +621,41 @@ export default async function handler(req, res) {
 				}
 			}
 
-			const allAssetIds = Array.from(
-				new Set([...assetsByType.CLASSIC_TSHIRT, ...assetsByType.CLASSIC_SHIRT, ...assetsByType.CLASSIC_PANTS])
-			)
+			for (const assetType of INVENTORY_ASSET_TYPES) {
+				if (inventoryAssetIdsByType[assetType].size === 0) continue
 
-			if (allAssetIds.length === 0) return
+				let cursor = null
+				for (let page = 0; page < maxInventoryPages; page += 1) {
+					const subcategory = CATALOG_SEARCH_SUBCATEGORIES[assetType]
+					const url =
+						`https://catalog.roblox.com/v1/search/items/details` +
+						`?Category=3&Subcategory=${subcategory}&CreatorTargetId=${userId}&CreatorType=User&Limit=${CATALOG_SEARCH_LIMIT}` +
+						(cursor ? `&Cursor=${encodeURIComponent(cursor)}` : "")
 
-			const assetTypeLookup = new Map()
-			for (const id of assetsByType.CLASSIC_TSHIRT) assetTypeLookup.set(id, "CLASSIC_TSHIRT")
-			for (const id of assetsByType.CLASSIC_SHIRT) assetTypeLookup.set(id, "CLASSIC_SHIRT")
-			for (const id of assetsByType.CLASSIC_PANTS) assetTypeLookup.set(id, "CLASSIC_PANTS")
+					const searchJson = await robloxGetJson(url, "catalog.search", { userId, assetType, page })
+					if (!searchJson) break
 
-			for (let i = 0; i < allAssetIds.length; i += DEFAULTS.catalogBatchSize) {
-				const batchIds = allAssetIds.slice(i, i + DEFAULTS.catalogBatchSize)
+					const items = Array.isArray(searchJson?.data) ? searchJson.data : []
+					for (const item of items) {
+						const assetId = Number(item?.id)
+						if (!Number.isFinite(assetId) || assetId <= 0) continue
+						if (!inventoryAssetIdsByType[assetType].has(assetId)) continue
+						if (Number(item?.creatorTargetId) !== userId) continue
+						if (!isCatalogCreatorUser(item?.creatorType)) continue
+						if (isCatalogItemOffSale(item)) continue
+						if (!catalogItemMatchesAssetType(item, assetType)) continue
 
-				const details = await catalogPostItemsDetails(
-					batchIds,
-					errors,
-					userId,
-					log,
-					metrics,
-					buildCatalogHeaders,
-					() => csrfToken,
-					(v) => {
-						csrfToken = v
+						const price = parseRobuxPrice(item?.price)
+						if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) continue
+
+						const name =
+							(typeof item?.name === "string" && item.name.trim() !== "" && item.name) || `Asset ${assetId}`
+
+						addClothingAsset(assetType, assetId, name, price)
 					}
-				)
 
-				if (!details) continue
-
-				for (const item of details) {
-					const assetId = Number(item?.id)
-					if (!Number.isFinite(assetId) || assetId <= 0) continue
-
-					const assetType = assetTypeLookup.get(assetId)
-					if (!assetType) continue
-
-					const creatorType = typeof item?.creatorType === "string" ? item.creatorType.trim().toLowerCase() : ""
-					if (creatorType !== "user") continue
-					if (Number(item?.creatorTargetId) !== userId) continue
-
-					const price = parseRobuxPrice(item?.price)
-					if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) continue
-
-					const name =
-						(typeof item?.name === "string" && item.name.trim() !== "" && item.name) || `Asset ${assetId}`
-
-					addClothingAsset(assetType, assetId, name, price)
+					cursor = getNextPageToken(searchJson)
+					if (!cursor) break
 				}
 			}
 		}
