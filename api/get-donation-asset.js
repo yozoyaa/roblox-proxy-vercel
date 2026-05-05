@@ -783,48 +783,48 @@ export default async function handler(req, res) {
 		const data = {}
 		for (const key of ASSET_LIST_KEYS) data[key] = {}
 
-		// A) games -> placeIds
-		const gamesUrl = `https://games.roblox.com/v2/users/${userId}/games?sortOrder=Asc&limit=50`
-		const gamesJson = await robloxGetJson(gamesUrl, "games.list", { userId })
-
-		const gamesArr = Array.isArray(gamesJson?.data) ? gamesJson.data : []
-		const placeIdsRaw = []
-		for (const item of gamesArr) {
-			const pid = item?.rootPlace?.id
-			if (typeof pid === "number" && Number.isFinite(pid)) placeIdsRaw.push(pid)
-		}
-
-		const placeIds = Array.from(new Set(placeIdsRaw)).slice(0, maxPlaces)
-		out.summary.places = placeIds.length
-
-		// B) place -> universe
-		const universeIdSet = new Set()
-		await Promise.all(
-			placeIds.map((placeId) =>
-				limiter(async () => {
-					const universeUrl = `https://apis.roblox.com/universes/v1/places/${placeId}/universe`
-					const uniJson = await robloxGetJson(universeUrl, "universes.fromPlace", { userId, placeId })
-
-					const universeId = uniJson?.universeId
-					if (typeof universeId === "number" && Number.isFinite(universeId)) {
-						universeIdSet.add(universeId)
-					} else if (uniJson != null) {
-						errors.push({
-							step: "universes.fromPlace",
-							message: "Invalid universe response (missing universeId)",
-							context: { userId, placeId, response: uniJson },
-						})
-						log.warn(`FAIL step=universes.fromPlace reason=missing_universeId placeId=${placeId}`)
-					}
-				})
-			)
-		)
-
-		const universeIds = Array.from(universeIdSet)
-		out.summary.universes = universeIds.length
-
-		// C) gamepasses
 		if (includeGamepasses) {
+			// A) games -> placeIds
+			const gamesUrl = `https://games.roblox.com/v2/users/${userId}/games?sortOrder=Asc&limit=50`
+			const gamesJson = await robloxGetJson(gamesUrl, "games.list", { userId })
+
+			const gamesArr = Array.isArray(gamesJson?.data) ? gamesJson.data : []
+			const placeIdsRaw = []
+			for (const item of gamesArr) {
+				const pid = item?.rootPlace?.id
+				if (typeof pid === "number" && Number.isFinite(pid)) placeIdsRaw.push(pid)
+			}
+
+			const placeIds = Array.from(new Set(placeIdsRaw)).slice(0, maxPlaces)
+			out.summary.places = placeIds.length
+
+			// B) place -> universe
+			const universeIdSet = new Set()
+			await Promise.all(
+				placeIds.map((placeId) =>
+					limiter(async () => {
+						const universeUrl = `https://apis.roblox.com/universes/v1/places/${placeId}/universe`
+						const uniJson = await robloxGetJson(universeUrl, "universes.fromPlace", { userId, placeId })
+
+						const universeId = uniJson?.universeId
+						if (typeof universeId === "number" && Number.isFinite(universeId)) {
+							universeIdSet.add(universeId)
+						} else if (uniJson != null) {
+							errors.push({
+								step: "universes.fromPlace",
+								message: "Invalid universe response (missing universeId)",
+								context: { userId, placeId, response: uniJson },
+							})
+							log.warn(`FAIL step=universes.fromPlace reason=missing_universeId placeId=${placeId}`)
+						}
+					})
+				)
+			)
+
+			const universeIds = Array.from(universeIdSet)
+			out.summary.universes = universeIds.length
+
+			// C) gamepasses
 			const seenGamepassIds = new Set()
 
 			await Promise.all(
@@ -1032,7 +1032,6 @@ export default async function handler(req, res) {
 				}
 			}
 		} else if (includeClothing && !canViewInventory) {
-			// Not an error: user inventory is private / not viewable
 			log.info("SKIP clothing: inventory not viewable (canView=false)")
 		}
 
