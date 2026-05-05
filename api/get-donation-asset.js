@@ -7,20 +7,18 @@ const DEFAULTS = {
 	includeClothing: true,
 	maxPlaces: 50,
 	maxUniversePages: 10,
-	maxInventoryPages: 10,
+	maxCatalogPages: 10,
 	pageSize: 100,
 
 	concurrency: 5,
 }
 
-const INVENTORY_ASSET_TYPES = ["CLASSIC_TSHIRT", "CLASSIC_SHIRT", "CLASSIC_PANTS"]
-const CATALOG_SEARCH_SUBCATEGORIES = {
-	CLASSIC_TSHIRT: 55,
-	CLASSIC_SHIRT: 56,
-	CLASSIC_PANTS: 57,
+const CLOTHING_ASSET_TYPES = {
+	CLASSIC_TSHIRT: 2,
+	CLASSIC_SHIRT: 11,
+	CLASSIC_PANTS: 12,
 }
-const CATALOG_SEARCH_LIMIT = 30
-const ASSET_LIST_KEYS = ["GAMEPASS", ...INVENTORY_ASSET_TYPES]
+const ASSET_LIST_KEYS = ["GAMEPASS", ...Object.keys(CLOTHING_ASSET_TYPES)]
 const SOFT_ERROR = Symbol("soft_error")
 
 // Only the hosts this endpoint actually calls
@@ -226,17 +224,8 @@ function getSnippet(text) {
 		.trim()
 }
 
-function isSoftInventoryAccessError(status, text) {
-	if (status !== 401 && status !== 403 && status !== 404) return false
-
-	const snippet = getSnippet(text).toLowerCase()
-	return (
-		snippet === "" ||
-		snippet.includes("inventory") ||
-		snippet.includes("private") ||
-		snippet.includes("forbidden") ||
-		snippet.includes("permission")
-	)
+function isSoftCatalogClothingError(status) {
+	return status === 429 || status === 408 || status === 500 || status === 502 || status === 503 || status === 504
 }
 
 export default async function handler(req, res) {
@@ -309,8 +298,8 @@ export default async function handler(req, res) {
 			1,
 			100
 		)
-		const maxInventoryPages = clamp(
-			Number.isFinite(toInt(req.query.maxInventoryPages)) ? toInt(req.query.maxInventoryPages) : DEFAULTS.maxInventoryPages,
+		const maxCatalogPages = clamp(
+			Number.isFinite(toInt(req.query.maxCatalogPages)) ? toInt(req.query.maxCatalogPages) : DEFAULTS.maxCatalogPages,
 			1,
 			100
 		)
@@ -365,6 +354,8 @@ export default async function handler(req, res) {
 			const headers = step === "gamepasses.list" ? { ...baseHeaders } : buildAuthHeaders()
 			const isSoftError =
 				typeof options.softErrorPredicate === "function" ? options.softErrorPredicate : null
+			const isSoftException =
+				typeof options.softExceptionPredicate === "function" ? options.softExceptionPredicate : null
 
 			async function fetchTextOnce(targetUrl) {
 				await sleep(getUpstreamDelayMs())
@@ -518,6 +509,18 @@ export default async function handler(req, res) {
 					const isAbort = String(e && e.name) === "AbortError"
 					const isLast = attempt >= MAX_ATTEMPTS
 
+					if (
+						isSoftException &&
+						isSoftException({
+							error: e,
+							isAbort,
+							context,
+						})
+					) {
+						log.warn(`SKIP step=${step} reason=soft_exception error="${String(e)}"`)
+						return SOFT_ERROR
+					}
+
 					if (!isLast) {
 						const waitMs = computeBackoffMs(attempt, null)
 						metrics.upstreamRetries += 1
@@ -538,7 +541,7 @@ export default async function handler(req, res) {
 		}
 
 		function getClothingAssetTypeId(assetType) {
-			return assetType === "CLASSIC_TSHIRT" ? 2 : assetType === "CLASSIC_SHIRT" ? 11 : 12
+			return CLOTHING_ASSET_TYPES[assetType] || 0
 		}
 
 		function addClothingAsset(assetType, assetId, assetName, assetPrice) {
@@ -567,79 +570,54 @@ export default async function handler(req, res) {
 
 		function catalogItemMatchesAssetType(item, assetType) {
 			const expectedTypeId = getClothingAssetTypeId(assetType)
-			const expectedSubcategory = CATALOG_SEARCH_SUBCATEGORIES[assetType]
 
+			if (Number(item?.assetType) === expectedTypeId) return true
 			if (Number(item?.assetTypeId) === expectedTypeId) return true
-			if (Number(item?.subcategory) === expectedSubcategory || Number(item?.subcategoryId) === expectedSubcategory) return true
 
-			if (typeof item?.assetType === "string") {
-				const s = item.assetType.trim().toLowerCase().replace(/[\s_-]+/g, "")
-				if (assetType === "CLASSIC_TSHIRT" && (s === "classictshirt" || s === "tshirt")) return true
-				if (assetType === "CLASSIC_SHIRT" && (s === "classicshirt" || s === "shirt")) return true
-				if (assetType === "CLASSIC_PANTS" && (s === "classicpants" || s === "pants")) return true
-			}
-
-			// Search is already constrained by subcategory; fall back to accepting the scoped result.
-			return item?.assetTypeId == null && item?.assetType == null && item?.subcategory == null && item?.subcategoryId == null
+			return false
 		}
 
-		async function collectUserClassicClothingAssets() {
-			const inventoryAssetIdsByType = {
-				CLASSIC_TSHIRT: new Set(),
-				CLASSIC_SHIRT: new Set(),
-				CLASSIC_PANTS: new Set(),
-			}
+		async function collectCreatorClassicClothingAssets() {
+			for (const assetType of Object.keys(CLOTHING_ASSET_TYPES)) {
+				const expectedAssetTypeId = CLOTHING_ASSET_TYPES[assetType]
+				let cursor = null
 
-			for (const assetType of INVENTORY_ASSET_TYPES) {
-				let pageToken = null
-				for (let page = 0; page < maxInventoryPages; page += 1) {
-					const filterValue = `inventoryItemAssetTypes=${assetType}`
-					const url =
-						`https://apis.roblox.com/cloud/v2/users/${userId}/inventory-items` +
-						`?maxPageSize=${pageSize}` +
-						`&filter=${encodeURIComponent(filterValue)}` +
-						(pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "")
+				for (let page = 0; page < maxCatalogPages; page += 1) {
+					const urlObj = new URL("https://catalog.roblox.com/v2/search/items/details")
+					urlObj.searchParams.set("AssetTypeIds", String(expectedAssetTypeId))
+					urlObj.searchParams.set("CreatorTargetId", String(userId))
+					urlObj.searchParams.set("CreatorType", "User")
+					urlObj.searchParams.set("MinPrice", "1")
+					urlObj.searchParams.set("IncludeNotForSale", "false")
+					urlObj.searchParams.set("limit", String(pageSize))
+					urlObj.searchParams.set("sortOrder", "Desc")
+					urlObj.searchParams.set("CategoryFilter", "0")
+					urlObj.searchParams.set("SortAggregation", "0")
+					urlObj.searchParams.set("SortType", "0")
+					urlObj.searchParams.set("SalesTypeFilter", "0")
+					urlObj.searchParams.set("Keyword", "")
+					urlObj.searchParams.set("Topics", "")
+					urlObj.searchParams.set("TriggeredByTopicDiscovery", "false")
+					urlObj.searchParams.set("Taxonomy", "")
+					urlObj.searchParams.set("CreatorName", "")
+					urlObj.searchParams.set("MaxPrice", "2147483647")
+					if (cursor) urlObj.searchParams.set("cursor", cursor)
 
-					const invJson = await robloxGetJson(url, "inventory.list", { userId, assetType, page }, {
-						softErrorPredicate: ({ status, text }) => isSoftInventoryAccessError(status, text),
+					const searchJson = await robloxGetJson(urlObj.toString(), "catalog.search", { userId, assetType, page }, {
+						softErrorPredicate: ({ status }) => isSoftCatalogClothingError(status),
+						softExceptionPredicate: () => true,
 					})
 
-					if (invJson === SOFT_ERROR) {
-						log.warn("SKIP clothing: user inventory private or inaccessible")
-						return
+					if (searchJson === SOFT_ERROR) {
+						log.warn(`SKIP clothing type=${assetType}: catalog search soft error`)
+						break
 					}
-					if (!invJson) break
-
-					const items = Array.isArray(invJson?.inventoryItems) ? invJson.inventoryItems : []
-					for (const it of items) {
-						const assetId = Number(it?.assetDetails?.assetId)
-						if (Number.isFinite(assetId) && assetId > 0) inventoryAssetIdsByType[assetType].add(assetId)
-					}
-
-					pageToken = getNextPageToken(invJson)
-					if (!pageToken) break
-				}
-			}
-
-			for (const assetType of INVENTORY_ASSET_TYPES) {
-				if (inventoryAssetIdsByType[assetType].size === 0) continue
-
-				let cursor = null
-				for (let page = 0; page < maxInventoryPages; page += 1) {
-					const subcategory = CATALOG_SEARCH_SUBCATEGORIES[assetType]
-					const url =
-						`https://catalog.roblox.com/v1/search/items/details` +
-						`?Category=3&Subcategory=${subcategory}&CreatorTargetId=${userId}&CreatorType=User&Limit=${CATALOG_SEARCH_LIMIT}` +
-						(cursor ? `&Cursor=${encodeURIComponent(cursor)}` : "")
-
-					const searchJson = await robloxGetJson(url, "catalog.search", { userId, assetType, page })
 					if (!searchJson) break
 
 					const items = Array.isArray(searchJson?.data) ? searchJson.data : []
 					for (const item of items) {
 						const assetId = Number(item?.id)
 						if (!Number.isFinite(assetId) || assetId <= 0) continue
-						if (!inventoryAssetIdsByType[assetType].has(assetId)) continue
 						if (Number(item?.creatorTargetId) !== userId) continue
 						if (!isCatalogCreatorUser(item?.creatorType)) continue
 						if (isCatalogItemOffSale(item)) continue
@@ -756,7 +734,7 @@ export default async function handler(req, res) {
 		}
 
 		if (includeClothing) {
-			await collectUserClassicClothingAssets()
+			await collectCreatorClassicClothingAssets()
 		}
 
 		out.Data = data
