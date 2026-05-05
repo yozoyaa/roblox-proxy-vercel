@@ -18,6 +18,7 @@ const CLOTHING_ASSET_TYPES = {
 	CLASSIC_SHIRT: 11,
 	CLASSIC_PANTS: 12,
 }
+const CATALOG_SEARCH_LIMITS = [10, 28, 30, 60, 120]
 const ASSET_LIST_KEYS = ["GAMEPASS", ...Object.keys(CLOTHING_ASSET_TYPES)]
 const SOFT_ERROR = Symbol("soft_error")
 
@@ -202,6 +203,18 @@ function computeBackoffMs(attemptIndex, retryAfterMs) {
 	const exp = RETRY_BASE_DELAY_MS * Math.pow(2, attemptIndex - 1)
 	const jitter = Math.floor(Math.random() * 250)
 	return clampInt(exp + jitter, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS)
+}
+
+function getCatalogSearchLimit(rawLimit) {
+	const requested = Number.isFinite(rawLimit) ? rawLimit : 30
+
+	for (const limit of CATALOG_SEARCH_LIMITS) {
+		if (requested <= limit) {
+			return limit
+		}
+	}
+
+	return 120
 }
 
 function makeLogger(requestId) {
@@ -578,6 +591,18 @@ export default async function handler(req, res) {
 		}
 
 		async function collectCreatorClassicClothingAssets() {
+			if (!truthy(rbxCookie)) {
+				errors.push({
+					step: "config",
+					message: "Missing ROBLOX_SECURITY_COOKIE for catalog clothing search",
+					context: { userId },
+				})
+				log.warn("FAIL step=config reason=missing_catalog_cookie")
+				return
+			}
+
+			const catalogLimit = getCatalogSearchLimit(pageSize)
+
 			for (const assetType of Object.keys(CLOTHING_ASSET_TYPES)) {
 				const expectedAssetTypeId = CLOTHING_ASSET_TYPES[assetType]
 				let cursor = null
@@ -589,7 +614,7 @@ export default async function handler(req, res) {
 					urlObj.searchParams.set("CreatorType", "User")
 					urlObj.searchParams.set("MinPrice", "1")
 					urlObj.searchParams.set("IncludeNotForSale", "false")
-					urlObj.searchParams.set("limit", String(pageSize))
+					urlObj.searchParams.set("limit", String(catalogLimit))
 					urlObj.searchParams.set("sortOrder", "Desc")
 					urlObj.searchParams.set("CategoryFilter", "0")
 					urlObj.searchParams.set("SortAggregation", "0")
